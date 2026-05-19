@@ -206,7 +206,7 @@ impl BotState {
             .map(|r| (r.language, r.confidence))
     }
 
-    async fn translate(&self, text: &str, source: &str, target: &str) -> Option<String> {
+    async fn translate(&self, text: &str, source: &str, target: &str, format: &str) -> Option<String> {
         let resp = self
             .http
             .post(format!("{}/translate", self.lt_url))
@@ -214,7 +214,7 @@ impl BotState {
                 q: text,
                 source,
                 target,
-                format: "text",
+                format,
                 api_key: self.lt_api_key.as_deref(),
             })
             .send()
@@ -403,6 +403,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn strip_mx_reply(html: &str) -> &str {
+    if let Some(end) = html.find("</mx-reply>") {
+        html[end + "</mx-reply>".len()..].trim()
+    } else {
+        html.trim()
+    }
+}
+
 async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMessageEvent) {
     let MessageType::Text(text_content) = &event.content.msgtype else { return };
 
@@ -424,7 +432,7 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         return;
     }
 
-    // Strip reply fallback lines
+    // Strip reply fallback lines from plain text
     let text: String = raw
         .lines()
         .filter(|l| !l.starts_with("> "))
@@ -434,6 +442,12 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
     if text.is_empty() {
         return;
     }
+
+    // Extract HTML body if present, stripping the <mx-reply> fallback block
+    let html_source = text_content
+        .formatted
+        .as_ref()
+        .map(|f| strip_mx_reply(&f.body).to_owned());
 
     let Some((lang, confidence)) = state.detect(text).await else {
         warn!("Language detection failed ({})", event.sender);
@@ -451,23 +465,43 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         return;
     }
 
-    let mut lines = Vec::new();
+    let mut plain_lines = Vec::new();
+    let mut html_lines = Vec::new();
+
     for target in &targets {
         let flag = flag_for_lang(target);
-        match state.translate(text, &lang, target).await {
-            Some(translated) => lines.push(format!("{flag} {translated}")),
+
+        let plain = match state.translate(text, &lang, target, "text").await {
+            Some(t) => format!("{flag} {t}"),
             None => {
                 warn!("Translation to {target} failed");
-                lines.push(format!("{flag} [translation unavailable]"));
+                format!("{flag} [translation unavailable]")
             }
+        };
+
+        if let Some(ref html) = html_source {
+            let html_translated = match state.translate(html, &lang, target, "html").await {
+                Some(t) => format!("{flag} {t}"),
+                None => plain.clone(),
+            };
+            html_lines.push(html_translated);
         }
+
+        plain_lines.push(plain);
     }
 
-    let body = lines.join("\n");
+    let plain_body = plain_lines.join("\n");
 
-    let without_relation = RoomMessageEventContentWithoutRelation::new(MessageType::Text(
-        TextMessageEventContent::plain(body.clone()),
-    ));
+    let without_relation = if !html_lines.is_empty() {
+        RoomMessageEventContentWithoutRelation::new(MessageType::Text(
+            TextMessageEventContent::html(plain_body.clone(), html_lines.join("<br>\n")),
+        ))
+    } else {
+        RoomMessageEventContentWithoutRelation::new(MessageType::Text(
+            TextMessageEventContent::plain(plain_body.clone()),
+        ))
+    };
+
     let reply = Reply {
         event_id: event.event_id.clone(),
         enforce_thread: EnforceThread::Unthreaded,
@@ -478,7 +512,11 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         Ok(c) => c,
         Err(err) => {
             warn!("make_reply_event failed ({err}), sending without reply threading");
-            RoomMessageEventContent::text_plain(body)
+            if !html_lines.is_empty() {
+                RoomMessageEventContent::text_html(plain_body, html_lines.join("<br>\n"))
+            } else {
+                RoomMessageEventContent::text_plain(plain_body)
+            }
         }
     };
 
