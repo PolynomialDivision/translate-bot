@@ -1,0 +1,21 @@
+[package]
+name = "translate-bot"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "translate-bot"
+path = "src/main.rs"
+
+[dependencies]
+matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "7677f090990a0fd3ac0e578da24434d4f80cb4c8" }
+matrix-sdk-base = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "7677f090990a0fd3ac0e578da24434d4f80cb4c8" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+futures-util = "0.3"

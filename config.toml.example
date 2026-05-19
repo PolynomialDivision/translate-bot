@@ -1,0 +1,43 @@
+[matrix]
+homeserver = "https://matrix.org"
+# Bot account credentials — create a separate account for this bot
+user_id = "@yourtranslatebot:matrix.org"
+access_token = "YOUR_ACCESS_TOKEN"
+# Optional: security key from Element's "Set up Secure Backup"
+# Needed once to self-sign the bot's device (removes "not verified by owner" warning).
+# Steps: log in as bot in Element Web → Settings → Security → Set up Secure Backup → generate key
+# After first successful run showing "Cross-signing bootstrapped", remove this line.
+recovery_key = "EsXX xxxx xxxx xxxx xxxx xxxx xxxx xxxx"
+device_id = "YOUR_DEVICE_ID"
+
+[libretranslate]
+# Option A: official public instance (free API key required — sign up at libretranslate.com)
+url = "https://libretranslate.com"
+api_key = "YOUR_API_KEY"
+
+# Option B: open mirrors (no API key needed)
+# url = "https://translate.argosopentech.com"
+
+# Option C: self-hosted (no API key needed by default)
+# url = "http://your-unraid-ip:5000"
+
+[translation]
+# Languages to translate between (bot translates between these two)
+langs = ["en", "de", "uk"]
+# Minimum detection confidence to attempt translation (0.0–1.0)
+min_confidence = 0.5
+
+[security]
+# Users allowed to issue !reset-trust @user:server commands.
+# Only these users can allow someone to re-verify after their first verification.
+admin_users = ["@you:matrix.org"]
+
+# Only these users may invite the bot to a room.
+# If empty, the bot accepts invites from everyone (not recommended).
+allowed_inviters = ["@you:matrix.org"]
+
+# Which devices receive room keys. Options:
+#   identity_based  — only devices cross-signed by their owner (default, recommended)
+#   only_trusted    — only explicitly verified devices
+#   all_devices     — all devices, no restriction
+encryption_strategy = "identity_based"

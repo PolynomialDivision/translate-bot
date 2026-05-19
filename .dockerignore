@@ -1,0 +1,8 @@
+# Credentials
+config.toml
+
+# Runtime data
+store/
+
+# Pre-built binary artifacts (not needed, we build inside Docker now)
+target/

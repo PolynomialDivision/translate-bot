@@ -1,0 +1,12 @@
+# Credentials — never commit
+config.toml
+access
+
+# Runtime data
+store/
+
+# Rust build artifacts
+target/
+
+# Docker artifacts
+*.tar.gz
