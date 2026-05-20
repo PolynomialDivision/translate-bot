@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
         .collect();
 
     if admin_users.is_empty() {
-        warn!("No admin_users configured — !reset-trust command will not work");
+        warn!("No admin_users configured — !reset-trust command is disabled");
     } else {
         info!("Admin users: {:?}", admin_users);
     }
