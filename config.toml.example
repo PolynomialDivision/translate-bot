@@ -26,6 +26,9 @@ api_key = "YOUR_API_KEY"
 langs = ["en", "de", "uk"]
 # Minimum detection confidence to attempt translation (0.0–1.0)
 min_confidence = 0.5
+# Post translations inside the Matrix thread of the original message (default: true).
+# Set to false to post as a plain room message instead.
+# thread_replies = true
 
 [security]
 # Users allowed to issue !reset-trust @user:server commands.

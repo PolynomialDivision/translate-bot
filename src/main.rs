@@ -36,18 +36,17 @@ use matrix_sdk::{
     encryption::verification::{
         SasState, Verification, VerificationRequest, VerificationRequestState,
     },
-    room::reply::{EnforceThread, Reply},
     ruma::{
-        OwnedDeviceId, OwnedUserId,
+        OwnedDeviceId, OwnedEventId, OwnedUserId,
         api::client::filter::FilterDefinition,
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
+            relation::Thread,
             room::{
                 member::StrippedRoomMemberEvent,
                 message::{
-                    AddMentions, MessageType, OriginalSyncRoomMessageEvent,
-                    RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
-                    TextMessageEventContent,
+                    MessageType, OriginalSyncRoomMessageEvent,
+                    Relation, RoomMessageEventContent,
                 },
             },
         },
@@ -90,6 +89,10 @@ struct TranslationConfig {
     langs: Vec<String>,
     #[serde(default = "default_min_confidence")]
     min_confidence: f64,
+    /// Post translations inside the Matrix thread of the original message (default: true).
+    /// Set to false to post as a plain room message instead.
+    #[serde(default = "default_true")]
+    thread_replies: bool,
 }
 
 fn default_langs() -> Vec<String> {
@@ -100,9 +103,11 @@ fn default_min_confidence() -> f64 {
     0.5
 }
 
+fn default_true() -> bool { true }
+
 impl Default for TranslationConfig {
     fn default() -> Self {
-        Self { langs: default_langs(), min_confidence: default_min_confidence() }
+        Self { langs: default_langs(), min_confidence: default_min_confidence(), thread_replies: true }
     }
 }
 
@@ -179,6 +184,7 @@ struct BotState {
     lt_api_key: Option<String>,
     langs: Vec<String>,
     min_confidence: f64,
+    thread_replies: bool,
     http: reqwest::Client,
     bot_user_id: OwnedUserId,
     admin_users: HashSet<OwnedUserId>,
@@ -305,6 +311,7 @@ async fn main() -> Result<()> {
         lt_api_key: config.libretranslate.api_key,
         langs: config.translation.langs,
         min_confidence: config.translation.min_confidence,
+        thread_replies: config.translation.thread_replies,
         http: reqwest::Client::new(),
         bot_user_id: user_id,
         admin_users,
@@ -492,36 +499,38 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
 
     let plain_body = plain_lines.join("\n");
 
-    let without_relation = if !html_lines.is_empty() {
-        RoomMessageEventContentWithoutRelation::new(MessageType::Text(
-            TextMessageEventContent::html(plain_body.clone(), html_lines.join("<br>\n")),
-        ))
+    let mut content = if !html_lines.is_empty() {
+        RoomMessageEventContent::text_html(plain_body, html_lines.join("<br>\n"))
     } else {
-        RoomMessageEventContentWithoutRelation::new(MessageType::Text(
-            TextMessageEventContent::plain(plain_body.clone()),
-        ))
+        RoomMessageEventContent::text_plain(plain_body)
     };
 
-    let reply = Reply {
-        event_id: event.event_id.clone(),
-        enforce_thread: EnforceThread::Unthreaded,
-        add_mentions: AddMentions::No,
-    };
-
-    let content = match room.make_reply_event(without_relation, reply).await {
-        Ok(c) => c,
-        Err(err) => {
-            warn!("make_reply_event failed ({err}), sending without reply threading");
-            if !html_lines.is_empty() {
-                RoomMessageEventContent::text_html(plain_body, html_lines.join("<br>\n"))
-            } else {
-                RoomMessageEventContent::text_plain(plain_body)
-            }
-        }
-    };
+    if state.thread_replies {
+        let thread_root = resolve_thread_root(&event);
+        info!("thread_root={} for event={}", thread_root, event.event_id);
+        content.relates_to = Some(Relation::Thread(Thread::reply(
+            thread_root.clone(),
+            thread_root,
+        )));
+    }
 
     if let Err(e) = room.send(content).await {
         error!("Failed to send translation: {e}");
+    }
+}
+
+/// Determine the Matrix thread root for a given incoming event using the
+/// priority defined in the Matrix spec:
+///
+/// 1. Event is already in a thread (`m.thread`) → use that thread's root.
+/// 2. Event is a plain reply (`m.in_reply_to`) → treat the replied-to event
+///    as the root (avoids a round-trip to fetch and inspect the parent).
+/// 3. Otherwise → this event starts a new thread; use its own event_id.
+fn resolve_thread_root(event: &OriginalSyncRoomMessageEvent) -> OwnedEventId {
+    match &event.content.relates_to {
+        Some(Relation::Thread(thread)) => thread.event_id.clone(),
+        Some(Relation::Reply(reply)) => reply.in_reply_to.event_id.clone(),
+        _ => event.event_id.clone(),
     }
 }
 
