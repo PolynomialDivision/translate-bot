@@ -53,7 +53,7 @@ use matrix_sdk::{
         },
     },
 };
-use matrix_sdk_base::crypto::CollectStrategy;
+use matrix_sdk_crypto::CollectStrategy;
 use serde::{Deserialize, Serialize};
 use tokio::{fs, sync::Mutex, time::sleep};
 use tracing::{error, info, warn};
