@@ -1,7 +1,7 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -41,12 +41,13 @@ use matrix_sdk::{
         api::client::filter::FilterDefinition,
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
-            relation::Thread,
+            relation::{Replacement, Thread},
             room::{
                 member::StrippedRoomMemberEvent,
                 message::{
                     MessageType, OriginalSyncRoomMessageEvent,
                     Relation, RoomMessageEventContent,
+                    RoomMessageEventContentWithoutRelation, TextMessageEventContent,
                 },
             },
         },
@@ -192,6 +193,9 @@ struct BotState {
     // Users allowed to re-verify despite already having a verified device.
     // Populated by !reset-trust from an admin, cleared after use.
     reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
+    // Maps user's original event_id → bot's translation event_id.
+    // Used to edit the bot's translation when the user edits their message.
+    translation_map: Arc<RwLock<HashMap<OwnedEventId, OwnedEventId>>>,
 }
 
 impl BotState {
@@ -317,6 +321,7 @@ async fn main() -> Result<()> {
         admin_users,
         allowed_inviters,
         reset_allowed: Arc::new(Mutex::new(HashSet::new())),
+        translation_map: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // Auto-join invited rooms (only from allowed_inviters)
@@ -419,6 +424,16 @@ fn strip_mx_reply(html: &str) -> &str {
 }
 
 async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMessageEvent) {
+    // Edits arrive as m.replace — route them to handle_edit and stop.
+    // Must be checked BEFORE the msgtype guard: the top-level body of an edit
+    // is only a fallback ("* new text") for old clients and must NOT be translated.
+    if let Some(Relation::Replacement(ref replacement)) = event.content.relates_to {
+        let original_event_id = replacement.event_id.clone();
+        let new_content = replacement.new_content.clone();
+        handle_edit(state, room, original_event_id, new_content).await;
+        return;
+    }
+
     let MessageType::Text(text_content) = &event.content.msgtype else { return };
 
     let raw = text_content.body.trim();
@@ -514,8 +529,12 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         )));
     }
 
-    if let Err(e) = room.send(content).await {
-        error!("Failed to send translation: {e}");
+    match room.send(content).await {
+        Ok(resp) => {
+            state.translation_map.write().unwrap()
+                .insert(event.event_id.clone(), resp.response.event_id);
+        }
+        Err(e) => error!("Failed to send translation: {e}"),
     }
 }
 
@@ -531,6 +550,79 @@ fn resolve_thread_root(event: &OriginalSyncRoomMessageEvent) -> OwnedEventId {
         Some(Relation::Thread(thread)) => thread.event_id.clone(),
         Some(Relation::Reply(reply)) => reply.in_reply_to.event_id.clone(),
         _ => event.event_id.clone(),
+    }
+}
+
+/// Called when a user edits a message the bot previously translated.
+/// Re-translates the new content and edits the bot's existing translation
+/// in-place using m.replace — no new message is sent, thread context is preserved.
+async fn handle_edit(
+    state: BotState,
+    room: Room,
+    original_event_id: OwnedEventId,
+    new_content: RoomMessageEventContentWithoutRelation,
+) {
+    // Look up whether we have a translation for this event.
+    let bot_event_id = state.translation_map.read().unwrap()
+        .get(&original_event_id)
+        .cloned();
+
+    let Some(bot_event_id) = bot_event_id else {
+        info!("Edit for unknown event {original_event_id} — no cached translation, ignoring");
+        return;
+    };
+
+    // Use ONLY m.new_content as the source of truth (full replacement, not a diff).
+    let MessageType::Text(text_content) = &new_content.msgtype else { return };
+    let raw = text_content.body.trim();
+
+    // Strip reply fallback lines (same as normal message handling).
+    let text: String = raw.lines()
+        .filter(|l| !l.starts_with("> "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim();
+    if text.is_empty() { return; }
+
+    let Some((lang, confidence)) = state.detect(text).await else {
+        warn!("Language detection failed for edit of {original_event_id}");
+        return;
+    };
+
+    if confidence < state.min_confidence || !state.langs.contains(&lang) { return; }
+
+    let targets: Vec<&String> = state.langs.iter().filter(|t| t.as_str() != lang).collect();
+    if targets.is_empty() { return; }
+
+    let mut plain_lines = Vec::new();
+    for target in &targets {
+        let flag = flag_for_lang(target);
+        let translated = match state.translate(text, &lang, target, "text").await {
+            Some(t) => format!("{flag} {t}"),
+            None => {
+                warn!("Translation to {target} failed for edit of {original_event_id}");
+                format!("{flag} [translation unavailable]")
+            }
+        };
+        plain_lines.push(translated);
+    }
+
+    let new_body = plain_lines.join("\n");
+
+    // Build m.replace pointing at the bot's existing translation event.
+    // The thread membership is inherited from bot_event_id — no thread relation needed here.
+    let new_without = RoomMessageEventContentWithoutRelation::new(
+        MessageType::Text(TextMessageEventContent::plain(new_body.clone())),
+    );
+    let mut edit_content = RoomMessageEventContent::text_plain(format!("* {new_body}"));
+    edit_content.relates_to = Some(Relation::Replacement(Replacement::new(
+        bot_event_id.clone(),
+        new_without,
+    )));
+
+    info!("Editing bot translation {bot_event_id} for edit of {original_event_id}");
+    if let Err(e) = room.send(edit_content).await {
+        error!("Failed to send translation edit: {e}");
     }
 }
 
