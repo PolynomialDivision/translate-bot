@@ -460,9 +460,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    client.sync(SyncSettings::default().filter(filter.into())).await?;
-
-    Ok(())
+    loop {
+        match client.sync(SyncSettings::default().filter(filter.clone().into())).await {
+            Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
+            Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
+        }
+        sleep(Duration::from_secs(5)).await;
+    }
 }
 
 fn strip_mx_reply(html: &str) -> &str {
