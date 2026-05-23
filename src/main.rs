@@ -5,6 +5,8 @@ use std::{
     time::Duration,
 };
 
+use mxbot_common::config::{MatrixConfig, SecurityConfig};
+
 fn flag_for_lang(lang: &str) -> &'static str {
     match lang {
         "en" => "🇬🇧",
@@ -28,16 +30,11 @@ fn flag_for_lang(lang: &str) -> &'static str {
 }
 
 use anyhow::Result;
-use futures_util::StreamExt;
 use matrix_sdk::{
-    Client, Room, RoomState, SessionMeta, SessionTokens,
-    authentication::matrix::MatrixSession,
+    Client, Room, RoomState,
     config::SyncSettings,
-    encryption::verification::{
-        SasState, Verification, VerificationRequest, VerificationRequestState,
-    },
     ruma::{
-        OwnedDeviceId, OwnedEventId, OwnedServerName, OwnedUserId, RoomOrAliasId,
+        OwnedEventId, OwnedServerName, OwnedUserId, RoomOrAliasId,
         api::client::filter::FilterDefinition,
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
@@ -53,7 +50,6 @@ use matrix_sdk::{
         },
     },
 };
-use matrix_sdk_crypto::CollectStrategy;
 use serde::{Deserialize, Serialize};
 use tokio::{fs, sync::Mutex, time::sleep};
 use tracing::{error, info, warn};
@@ -66,16 +62,6 @@ struct Config {
     translation: TranslationConfig,
     #[serde(default)]
     security: SecurityConfig,
-}
-
-#[derive(Deserialize)]
-struct MatrixConfig {
-    homeserver: String,
-    user_id: String,
-    access_token: String,
-    device_id: String,
-    // Security key from Element's "Set up Secure Backup" — used once to self-sign the bot's device
-    recovery_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -109,44 +95,6 @@ fn default_true() -> bool { true }
 impl Default for TranslationConfig {
     fn default() -> Self {
         Self { langs: default_langs(), min_confidence: default_min_confidence(), thread_replies: true }
-    }
-}
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum EncryptionStrategy {
-    /// Share keys with all devices (no restriction).
-    AllDevices,
-    /// Only share keys with devices cross-signed by their owner (recommended).
-    #[default]
-    IdentityBased,
-    /// Only share keys with devices that are explicitly trusted/verified.
-    OnlyTrusted,
-}
-
-impl From<EncryptionStrategy> for CollectStrategy {
-    fn from(s: EncryptionStrategy) -> Self {
-        match s {
-            EncryptionStrategy::AllDevices => CollectStrategy::AllDevices,
-            EncryptionStrategy::IdentityBased => CollectStrategy::IdentityBasedStrategy,
-            EncryptionStrategy::OnlyTrusted => CollectStrategy::OnlyTrustedDevices,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct SecurityConfig {
-    #[serde(default)]
-    admin_users: Vec<String>,
-    #[serde(default)]
-    allowed_inviters: Vec<String>,
-    #[serde(default)]
-    encryption_strategy: EncryptionStrategy,
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self { admin_users: vec![], allowed_inviters: vec![], encryption_strategy: EncryptionStrategy::default() }
     }
 }
 
@@ -248,41 +196,11 @@ async fn main() -> Result<()> {
     let store_path = PathBuf::from(
         std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()),
     );
-    fs::create_dir_all(&store_path).await?;
-
-    let strategy: CollectStrategy = config.security.encryption_strategy.into();
-    info!("Encryption strategy: {:?}", strategy);
-
-    let client = Client::builder()
-        .homeserver_url(&config.matrix.homeserver)
-        .sqlite_store(&store_path, None)
-        .with_room_key_recipient_strategy(strategy)
-        .build()
-        .await?;
-
-    let user_id: OwnedUserId = config.matrix.user_id.parse()?;
-    let device_id: OwnedDeviceId = OwnedDeviceId::from(config.matrix.device_id);
-
-    client
-        .restore_session(MatrixSession {
-            meta: SessionMeta { user_id: user_id.clone(), device_id },
-            tokens: SessionTokens {
-                access_token: config.matrix.access_token,
-                refresh_token: None,
-            },
-        })
-        .await?;
-
-    info!("Session restored as {}", user_id);
-
-    if let Some(ref key) = config.matrix.recovery_key {
-        info!("Recovering cross-signing keys from secure backup...");
-        match client.encryption().recovery().recover(key).await {
-            Ok(()) => info!("Cross-signing keys recovered"),
-            Err(e) => warn!("Recovery failed: {e}"),
-        }
-    }
-    bootstrap_cross_signing(&client, &user_id).await;
+    let (client, user_id) = mxbot_common::session::build_and_restore(
+        &config.matrix,
+        &store_path,
+        config.security.encryption_strategy.into(),
+    ).await?;
 
     let admin_users: HashSet<OwnedUserId> = config
         .security
@@ -363,7 +281,7 @@ async fn main() -> Result<()> {
                                 info!("Joined {room_id}");
                                 return;
                             }
-                            Err(ref e) if is_join_terminal(e) => {
+                            Err(ref e) if mxbot_common::verify::is_join_terminal(e) => {
                                 warn!("Join failed (terminal) for {room_id}: {e}");
                                 return;
                             }
@@ -396,7 +314,9 @@ async fn main() -> Result<()> {
                     warn!("to-device verification request object not found");
                     return;
                 };
-                tokio::spawn(handle_verification_request(client, state, request));
+                tokio::spawn(mxbot_common::verify::handle_verification_request(
+                    client, Arc::clone(&state.reset_allowed), request,
+                ));
             }
         }
     });
@@ -418,7 +338,9 @@ async fn main() -> Result<()> {
                         warn!("in-room verification request object not found");
                         return;
                     };
-                    tokio::spawn(handle_verification_request(client, state, request));
+                    tokio::spawn(mxbot_common::verify::handle_verification_request(
+                    client, Arc::clone(&state.reset_allowed), request,
+                ));
                     return;
                 }
 
@@ -680,108 +602,3 @@ async fn handle_edit(
     }
 }
 
-async fn handle_verification_request(
-    client: Client,
-    state: BotState,
-    request: VerificationRequest,
-) {
-    let user_id = request.other_user_id();
-
-    // Check if this user already has a verified device
-    let already_verified = client
-        .encryption()
-        .get_user_devices(user_id)
-        .await
-        .map(|devices| devices.devices().any(|d| d.is_verified()))
-        .unwrap_or(false);
-
-    if already_verified {
-        // Allow only if an admin explicitly reset this user's trust
-        let allowed = state.reset_allowed.lock().await.remove(user_id);
-        if !allowed {
-            warn!(
-                "Rejecting verification from {} — already has a verified device",
-                user_id
-            );
-            request.cancel().await.ok();
-            return;
-        }
-        info!("Allowing re-verification for {} (trust was reset by admin)", user_id);
-    }
-
-    info!("Accepting verification from {}", user_id);
-    if let Err(e) = request.accept().await {
-        error!("Failed to accept verification request: {e}");
-        return;
-    }
-
-    let mut stream = request.changes();
-    while let Some(state) = stream.next().await {
-        match state {
-            VerificationRequestState::Transitioned { verification } => {
-                if let Verification::SasV1(sas) = verification {
-                    tokio::spawn(handle_sas(sas));
-                    break;
-                }
-            }
-            VerificationRequestState::Done | VerificationRequestState::Cancelled(_) => break,
-            _ => {}
-        }
-    }
-}
-
-async fn handle_sas(sas: matrix_sdk::encryption::verification::SasVerification) {
-    info!("SAS with {} {}", sas.other_device().user_id(), sas.other_device().device_id());
-
-    if let Err(e) = sas.accept().await {
-        error!("Failed to accept SAS: {e}");
-        return;
-    }
-
-    let mut stream = sas.changes();
-    while let Some(state) = stream.next().await {
-        match state {
-            SasState::KeysExchanged { .. } => {
-                info!("Auto-confirming emojis");
-                if let Err(e) = sas.confirm().await {
-                    error!("SAS confirm failed: {e}");
-                    break;
-                }
-            }
-            SasState::Done { .. } => {
-                info!(
-                    "Verification done: {} {}",
-                    sas.other_device().user_id(),
-                    sas.other_device().device_id()
-                );
-                break;
-            }
-            SasState::Cancelled(info) => {
-                warn!("Verification cancelled: {}", info.reason());
-                break;
-            }
-            _ => {}
-        }
-    }
-}
-
-fn is_join_terminal(e: &matrix_sdk::Error) -> bool {
-    let s = e.to_string();
-    s.contains("No known servers")
-        || s.contains("M_FORBIDDEN")
-        || s.contains("M_UNKNOWN_TOKEN")
-        || s.contains("M_GUEST_ACCESS_FORBIDDEN")
-}
-
-async fn bootstrap_cross_signing(client: &Client, user_id: &OwnedUserId) {
-    if let Some(status) = client.encryption().cross_signing_status().await {
-        if status.has_master && status.has_self_signing && status.has_user_signing {
-            info!("Cross-signing already complete (keys present) — skipping bootstrap");
-            return;
-        }
-    }
-    match client.encryption().bootstrap_cross_signing(None).await {
-        Ok(()) => info!("Cross-signing bootstrapped — bot device is now self-signed"),
-        Err(e) => warn!("Cross-signing bootstrap failed for {user_id}: {e}"),
-    }
-}

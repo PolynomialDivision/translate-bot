@@ -2062,6 +2062,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mxbot-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "matrix-sdk",
+ "matrix-sdk-crypto",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3625,6 +3638,7 @@ dependencies = [
  "futures-util",
  "matrix-sdk",
  "matrix-sdk-crypto",
+ "mxbot-common",
  "reqwest",
  "serde",
  "serde_json",
