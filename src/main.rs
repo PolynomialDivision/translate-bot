@@ -546,9 +546,11 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
     if state.thread_replies {
         let thread_root = resolve_thread_root(&event);
         info!("thread_root={} for event={}", thread_root, event.event_id);
+        // reply_to = event.event_id so the translation quotes the specific
+        // message it translated, not always the thread root.
         content.relates_to = Some(Relation::Thread(Thread::reply(
-            thread_root.clone(),
             thread_root,
+            event.event_id.clone(),
         )));
     }
 
