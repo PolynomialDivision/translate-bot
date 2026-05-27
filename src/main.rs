@@ -46,6 +46,7 @@ use matrix_sdk::{
                     Relation, RoomMessageEventContent,
                     RoomMessageEventContentWithoutRelation, TextMessageEventContent,
                 },
+                redaction::OriginalSyncRoomRedactionEvent,
             },
         },
     },
@@ -349,6 +350,52 @@ async fn main() -> Result<()> {
                 }
 
                 tokio::spawn(handle_message(state, room, ev));
+            }
+        }
+    });
+
+    // Redactions: if a user deletes their original message, delete the bot's
+    // translation too — including thread replies that would otherwise be orphaned.
+    client.add_event_handler({
+        let state = state.clone();
+        move |ev: OriginalSyncRoomRedactionEvent, room: Room| {
+            let state = state.clone();
+            async move {
+                // `redacts` can be None in some room versions / federation edge cases.
+                let redacted_id = match ev.redacts {
+                    Some(ref id) => id.clone(),
+                    None => {
+                        warn!("Redaction event has no `redacts` field — ignoring");
+                        return;
+                    }
+                };
+
+                // Check whether we have a translation for this event.
+                let bot_event_id = match state.translation_map.read() {
+                    Ok(map) => map.get(&redacted_id).cloned(),
+                    Err(e)  => {
+                        warn!("translation_map lock poisoned on redaction read: {e}");
+                        return;
+                    }
+                };
+
+                let Some(bot_event_id) = bot_event_id else { return };
+
+                info!(
+                    "Original message {redacted_id} was redacted — \
+                     redacting bot translation {bot_event_id}"
+                );
+
+                if let Err(e) = room.redact(&bot_event_id, None, None).await {
+                    warn!("Failed to redact translation {bot_event_id}: {e}");
+                    return;
+                }
+
+                // Remove from map so we don't attempt a double-redact.
+                match state.translation_map.write() {
+                    Ok(mut map) => { map.remove(&redacted_id); }
+                    Err(e)      => warn!("translation_map lock poisoned on redaction write: {e}"),
+                }
             }
         }
     });
