@@ -31,6 +31,7 @@ fn flag_for_lang(lang: &str) -> &'static str {
 
 use anyhow::Result;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::html::push_html;
 use pulldown_cmark_to_cmark::cmark;
 use matrix_sdk::{
     Client, Room, RoomState,
@@ -519,13 +520,6 @@ mod tests {
     }
 }
 
-fn strip_mx_reply(html: &str) -> &str {
-    if let Some(end) = html.find("</mx-reply>") {
-        html[end + "</mx-reply>".len()..].trim()
-    } else {
-        html.trim()
-    }
-}
 
 /// Parse `markdown` and return the indices + full text of every `Event::Text`
 /// node that sits outside a code block.  These are the nodes that should be
@@ -610,6 +604,16 @@ async fn translate_markdown(
         .unwrap_or_else(|| plain.trim().to_owned())
 }
 
+fn render_html(markdown: &str) -> String {
+    let opts = Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
+    let mut html = String::new();
+    push_html(&mut html, Parser::new_ext(markdown, opts));
+    html
+}
+
 async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMessageEvent) {
     // Edits arrive as m.replace — route them to handle_edit and stop.
     // Must be checked BEFORE the msgtype guard: the top-level body of an edit
@@ -652,12 +656,6 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         return;
     }
 
-    // Extract HTML body if present, stripping the <mx-reply> fallback block
-    let html_source = text_content
-        .formatted
-        .as_ref()
-        .map(|f| strip_mx_reply(&f.body).to_owned());
-
     let Some((lang, confidence)) = state.detect(text).await else {
         warn!("Language detection failed ({})", event.sender);
         return;
@@ -679,29 +677,13 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
 
     for target in &targets {
         let flag = flag_for_lang(target);
-
-        // Translate the plain text body with Markdown structure preserved.
-        let plain = format!("{flag} {}", translate_markdown(&state, text, &lang, target).await);
-
-        // Translate the HTML formatted_body if the original message had one.
-        if let Some(ref html) = html_source {
-            let html_translated = match state.translate(html, &lang, target, "html").await {
-                Some(t) => format!("{flag} {t}"),
-                None    => plain.clone(),
-            };
-            html_lines.push(html_translated);
-        }
-
-        plain_lines.push(plain);
+        let translated_md = translate_markdown(&state, text, &lang, target).await;
+        plain_lines.push(format!("{flag} {}", translated_md));
+        html_lines.push(format!("{flag} {}", render_html(&translated_md)));
     }
 
     let plain_body = plain_lines.join("\n");
-
-    let mut content = if !html_lines.is_empty() {
-        RoomMessageEventContent::text_html(plain_body, html_lines.join("<br>\n"))
-    } else {
-        RoomMessageEventContent::text_plain(plain_body)
-    };
+    let mut content = RoomMessageEventContent::text_html(plain_body, html_lines.join("<br>\n"));
 
     if state.thread_replies {
         let thread_root = resolve_thread_root(&event);
@@ -780,20 +762,23 @@ async fn handle_edit(
     if targets.is_empty() { return; }
 
     let mut plain_lines = Vec::new();
+    let mut html_lines = Vec::new();
     for target in &targets {
         let flag = flag_for_lang(target);
-        let translated = format!("{flag} {}", translate_markdown(&state, text, &lang, target).await);
-        plain_lines.push(translated);
+        let translated_md = translate_markdown(&state, text, &lang, target).await;
+        plain_lines.push(format!("{flag} {}", translated_md));
+        html_lines.push(format!("{flag} {}", render_html(&translated_md)));
     }
 
     let new_body = plain_lines.join("\n");
+    let new_html = html_lines.join("<br>\n");
 
     // Build m.replace pointing at the bot's existing translation event.
     // The thread membership is inherited from bot_event_id — no thread relation needed here.
     let new_without = RoomMessageEventContentWithoutRelation::new(
-        MessageType::Text(TextMessageEventContent::plain(new_body.clone())),
+        MessageType::Text(TextMessageEventContent::html(new_body.clone(), new_html.clone())),
     );
-    let mut edit_content = RoomMessageEventContent::text_plain(format!("* {new_body}"));
+    let mut edit_content = RoomMessageEventContent::text_html(format!("* {new_body}"), new_html);
     edit_content.relates_to = Some(Relation::Replacement(Replacement::new(
         bot_event_id.clone(),
         new_without,
