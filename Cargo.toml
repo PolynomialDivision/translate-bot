@@ -19,4 +19,6 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 futures-util = "0.3"
+pulldown-cmark          = "0.12"
+pulldown-cmark-to-cmark = "18"
 mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
