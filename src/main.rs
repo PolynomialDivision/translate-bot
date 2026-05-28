@@ -30,9 +30,8 @@ fn flag_for_lang(lang: &str) -> &'static str {
 }
 
 use anyhow::Result;
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Options, Parser};
 use pulldown_cmark::html::push_html;
-use pulldown_cmark_to_cmark::cmark;
 use matrix_sdk::{
     Client, Room, RoomState,
     config::SyncSettings,
@@ -445,78 +444,64 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn spans(markdown: &str) -> Vec<String> {
-        let opts = Options::ENABLE_STRIKETHROUGH
-            | Options::ENABLE_TABLES
-            | Options::ENABLE_TASKLISTS
-            | Options::ENABLE_FOOTNOTES;
-        let events: Vec<Event<'static>> = Parser::new_ext(markdown, opts)
-            .map(|e| e.into_static())
-            .collect();
-        collect_translatable_spans(&events)
-            .into_iter()
-            .map(|(_, t)| t)
-            .collect()
+    #[test]
+    fn render_html_bold_italic() {
+        let html = render_html("This is **bold** and *italic*");
+        assert!(html.contains("<strong>bold</strong>"));
+        assert!(html.contains("<em>italic</em>"));
     }
 
     #[test]
-    fn code_block_excluded() {
-        let texts = spans("Hello\n\n```rust\nlet x = 5;\n```\n\nWorld");
-        assert!(texts.iter().any(|t| t.contains("Hello")));
-        assert!(texts.iter().any(|t| t.contains("World")));
-        assert!(!texts.iter().any(|t| t.contains("let x = 5")));
+    fn render_html_code_block_preserved() {
+        let html = render_html("```rust\nlet x = 5;\n```");
+        assert!(html.contains("let x = 5;"));
+        assert!(html.contains("<code"));
     }
 
     #[test]
-    fn inline_code_excluded() {
-        // Event::Code is a distinct variant — never ends up in Event::Text spans.
-        let texts = spans("Run `cargo build` to compile");
-        assert!(!texts.iter().any(|t| t.contains("cargo build")));
-        assert!(texts.iter().any(|t| t.contains("compile") || t.contains("Run")));
+    fn render_html_inline_code_preserved() {
+        let html = render_html("Run `cargo build` to compile");
+        assert!(html.contains("<code>cargo build</code>"));
     }
 
     #[test]
-    fn link_text_included_url_excluded() {
-        // The visible link text is a Text event; the URL lives in the Tag::Link,
-        // which is a Start/End structural event — never a Text node.
-        let texts = spans("Visit [OpenAI](https://openai.com) today");
-        assert!(texts.iter().any(|t| t.contains("OpenAI")));
-        assert!(!texts.iter().any(|t| t.contains("https://")));
+    fn html_to_plain_strips_tags() {
+        let plain = html_to_plain("<p><strong>Hello</strong> world</p>");
+        assert_eq!(plain, "Hello world");
     }
 
     #[test]
-    fn bold_and_italic_text_included() {
-        // The text content inside Strong/Emphasis is still Event::Text.
-        let texts = spans("This is **bold** and *italic* text");
-        assert!(texts.iter().any(|t| t == "bold"));
-        assert!(texts.iter().any(|t| t == "italic"));
+    fn html_to_plain_newlines_on_paragraphs() {
+        let plain = html_to_plain("<p>First</p><p>Second</p>");
+        assert!(plain.contains("First"));
+        assert!(plain.contains("Second"));
+        // paragraphs separated by newlines
+        assert!(plain.contains('\n'));
     }
 
     #[test]
-    fn list_items_included() {
-        let texts = spans("- First item\n- Second item");
-        assert!(texts.iter().any(|t| t.contains("First item")));
-        assert!(texts.iter().any(|t| t.contains("Second item")));
+    fn html_to_plain_list_items() {
+        let plain = html_to_plain("<ul><li>Alpha</li><li>Beta</li></ul>");
+        assert!(plain.contains("Alpha"));
+        assert!(plain.contains("Beta"));
     }
 
     #[test]
-    fn blockquote_included() {
-        let texts = spans("> Quoted text here");
-        assert!(texts.iter().any(|t| t.contains("Quoted text here")));
+    fn html_to_plain_empty() {
+        assert!(html_to_plain("").is_empty());
+        assert!(html_to_plain("<p></p>").is_empty());
     }
 
     #[test]
-    fn indented_code_block_excluded() {
-        // 4-space indented code blocks also produce CodeBlock events.
-        let texts = spans("Normal text\n\n    code_here()\n\nMore text");
-        assert!(!texts.iter().any(|t| t.contains("code_here")));
-        assert!(texts.iter().any(|t| t.contains("Normal text")));
+    fn render_and_strip_roundtrip() {
+        let plain = html_to_plain(&render_html("Hello **world**"));
+        assert_eq!(plain, "Hello world");
     }
 
     #[test]
-    fn empty_document() {
-        assert!(spans("").is_empty());
-        assert!(spans("   ").is_empty());
+    fn html_to_plain_decodes_entities() {
+        let plain = html_to_plain(&render_html("a & b < c > d"));
+        assert_eq!(plain, "a & b < c > d");
     }
 }
 
@@ -525,85 +510,6 @@ mod tests {
 /// node that sits outside a code block.  These are the nodes that should be
 /// translated; all other events (code blocks, inline code, HTML, URLs) are
 /// left untouched.
-fn collect_translatable_spans(events: &[Event<'static>]) -> Vec<(usize, String)> {
-    let mut code_depth: usize = 0;
-    let mut spans = Vec::new();
-    for (i, ev) in events.iter().enumerate() {
-        match ev {
-            Event::Start(Tag::CodeBlock(_)) => code_depth += 1,
-            Event::End(TagEnd::CodeBlock)   => code_depth = code_depth.saturating_sub(1),
-            // Event::Code is inline code — excluded automatically (not Event::Text).
-            // Event::Text inside a code block is also excluded via code_depth.
-            Event::Text(s) if code_depth == 0 => spans.push((i, s.as_ref().to_owned())),
-            _ => {}
-        }
-    }
-    spans
-}
-
-/// Translate `markdown` while preserving all formatting structure.
-///
-/// Flow:
-///   1. Parse Markdown into a pulldown-cmark event stream.
-///   2. Collect every `Event::Text` node outside code blocks.
-///   3. Translate each node individually via LibreTranslate.
-///   4. Substitute translated text back and reconstruct Markdown with
-///      `pulldown-cmark-to-cmark`.
-///   5. If reconstruction fails, fall back to stripping Markdown syntax
-///      and translating the result as plain text.
-///
-/// Code blocks, inline code spans, and URLs are never sent to the
-/// translation engine.
-async fn translate_markdown(
-    state: &BotState,
-    markdown: &str,
-    source: &str,
-    target: &str,
-) -> String {
-    let opts = Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_TABLES
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_FOOTNOTES;
-
-    // Parse and immediately own all events so they are not tied to `markdown`'s
-    // lifetime — we need to mutate them after the async translation calls.
-    let mut events: Vec<Event<'static>> = Parser::new_ext(markdown, opts)
-        .map(|e| e.into_static())
-        .collect();
-
-    let spans = collect_translatable_spans(&events);
-
-    for (idx, original) in &spans {
-        let trimmed = original.trim();
-        if trimmed.is_empty() { continue; }
-
-        if let Some(translated) = state.translate(trimmed, source, target, "text").await {
-            // Preserve any leading/trailing whitespace that pulldown-cmark
-            // includes in the text node (e.g. newlines between block elements).
-            let leading: String  = original.chars().take_while(|c| c.is_whitespace()).collect();
-            let trailing: String = original.chars().rev()
-                .take_while(|c| c.is_whitespace())
-                .collect::<String>().chars().rev().collect();
-            events[*idx] = Event::Text(format!("{leading}{translated}{trailing}").into());
-        }
-    }
-
-    // Reconstruct Markdown from the modified event list.
-    let mut buf = String::with_capacity(markdown.len() + 64);
-    if cmark(events.iter(), &mut buf).is_ok() {
-        return buf;
-    }
-
-    // Fallback: strip Markdown syntax markers and translate as plain text.
-    warn!("Markdown reconstruction failed for target={target} — falling back to plain text");
-    let plain: String = markdown.chars()
-        .filter(|c| !matches!(c, '*' | '_' | '`'))
-        .collect();
-    state.translate(plain.trim(), source, target, "text")
-        .await
-        .unwrap_or_else(|| plain.trim().to_owned())
-}
-
 fn render_html(markdown: &str) -> String {
     let opts = Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TABLES
@@ -612,6 +518,58 @@ fn render_html(markdown: &str) -> String {
     let mut html = String::new();
     push_html(&mut html, Parser::new_ext(markdown, opts));
     html
+}
+
+/// Strip HTML tags to produce a plain-text fallback for Matrix `body`.
+/// Block-level closing tags are replaced with newlines for readability.
+fn html_to_plain(html: &str) -> String {
+    let s = html
+        .replace("</p>", "\n\n")
+        .replace("</li>", "\n")
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("</blockquote>", "\n");
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim()
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+/// Translate a Markdown message by rendering it to HTML first, then sending
+/// the HTML to LibreTranslate in HTML mode (one call, full context preserved).
+/// LibreTranslate's HTML mode skips <code> and <pre> content automatically.
+///
+/// Returns `(plain_body, formatted_html)`.
+async fn translate_message(
+    state: &BotState,
+    markdown: &str,
+    source: &str,
+    target: &str,
+) -> (String, String) {
+    let html_input = render_html(markdown);
+    match state.translate(&html_input, source, target, "html").await {
+        Some(translated_html) => {
+            let plain = html_to_plain(&translated_html);
+            (plain, translated_html)
+        }
+        None => {
+            warn!("Translation failed for target={target} — keeping original");
+            (markdown.to_owned(), html_input)
+        }
+    }
 }
 
 async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMessageEvent) {
@@ -677,9 +635,9 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
 
     for target in &targets {
         let flag = flag_for_lang(target);
-        let translated_md = translate_markdown(&state, text, &lang, target).await;
-        plain_lines.push(format!("{flag} {}", translated_md));
-        html_lines.push(format!("{flag} {}", render_html(&translated_md)));
+        let (plain, html) = translate_message(&state, text, &lang, target).await;
+        plain_lines.push(format!("{flag} {plain}"));
+        html_lines.push(format!("{flag} {html}"));
     }
 
     let plain_body = plain_lines.join("\n");
@@ -765,9 +723,9 @@ async fn handle_edit(
     let mut html_lines = Vec::new();
     for target in &targets {
         let flag = flag_for_lang(target);
-        let translated_md = translate_markdown(&state, text, &lang, target).await;
-        plain_lines.push(format!("{flag} {}", translated_md));
-        html_lines.push(format!("{flag} {}", render_html(&translated_md)));
+        let (plain, html) = translate_message(&state, text, &lang, target).await;
+        plain_lines.push(format!("{flag} {plain}"));
+        html_lines.push(format!("{flag} {html}"));
     }
 
     let new_body = plain_lines.join("\n");
