@@ -572,6 +572,51 @@ async fn translate_message(
     }
 }
 
+async fn handle_image_caption(
+    state: BotState,
+    room: Room,
+    event: OriginalSyncRoomMessageEvent,
+    caption: String,
+) {
+    let Some((lang, confidence)) = state.detect(&caption).await else {
+        warn!("Language detection failed for image caption ({})", event.sender);
+        return;
+    };
+
+    info!("image caption lang={lang} conf={confidence:.2} sender={} room={}", event.sender, room.room_id());
+
+    if confidence < state.min_confidence || !state.langs.contains(&lang) {
+        return;
+    }
+
+    let targets: Vec<&String> = state.langs.iter().filter(|t| t.as_str() != lang).collect();
+    if targets.is_empty() { return; }
+
+    let mut plain_lines = Vec::new();
+    let mut html_lines = Vec::new();
+    for target in &targets {
+        let flag = flag_for_lang(target);
+        let (plain, html) = translate_message(&state, &caption, &lang, target).await;
+        plain_lines.push(format!("{flag} {plain}"));
+        html_lines.push(format!("{flag} {html}"));
+    }
+
+    let plain_body = plain_lines.join("\n");
+    let mut content = RoomMessageEventContent::text_html(plain_body, html_lines.join("<br>\n"));
+
+    if state.thread_replies {
+        let thread_root = resolve_thread_root(&event);
+        content.relates_to = Some(Relation::Thread(Thread::reply(
+            thread_root,
+            event.event_id.clone(),
+        )));
+    }
+
+    if let Err(e) = room.send(content).await {
+        error!("Failed to send image caption translation: {e}");
+    }
+}
+
 async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMessageEvent) {
     // Edits arrive as m.replace — route them to handle_edit and stop.
     // Must be checked BEFORE the msgtype guard: the top-level body of an edit
@@ -580,6 +625,19 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         let original_event_id = replacement.event_id.clone();
         let new_content = replacement.new_content.clone();
         handle_edit(state, room, original_event_id, new_content).await;
+        return;
+    }
+
+    // Handle image messages — translate caption if present.
+    if let MessageType::Image(img) = &event.content.msgtype {
+        let caption = img.caption()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        // img borrow ends here; event can be moved below
+        if let Some(caption) = caption {
+            handle_image_caption(state, room, event, caption).await;
+        }
         return;
     }
 
