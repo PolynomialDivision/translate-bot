@@ -520,6 +520,18 @@ fn render_html(markdown: &str) -> String {
     html
 }
 
+/// Collapse block-level `<p>` tags into inline content suitable for embedding
+/// inside a single Matrix message line. Inter-paragraph breaks become `<br>`.
+fn inline_html(html: &str) -> String {
+    html.trim()
+        .replace("</p>\n<p>", "<br>")
+        .replace("</p><p>", "<br>")
+        .replace("</p>", "")
+        .replace("<p>", "")
+        .trim()
+        .to_owned()
+}
+
 /// Strip HTML tags to produce a plain-text fallback for Matrix `body`.
 /// Block-level closing tags are replaced with newlines for readability.
 fn html_to_plain(html: &str) -> String {
@@ -563,11 +575,11 @@ async fn translate_message(
     match state.translate(&html_input, source, target, "html").await {
         Some(translated_html) => {
             let plain = html_to_plain(&translated_html);
-            (plain, translated_html)
+            (plain, inline_html(&translated_html))
         }
         None => {
             warn!("Translation failed for target={target} — keeping original");
-            (markdown.to_owned(), html_input)
+            (markdown.to_owned(), inline_html(&html_input))
         }
     }
 }
