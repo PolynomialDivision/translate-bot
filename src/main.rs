@@ -733,17 +733,13 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
     }
 }
 
-/// Determine the Matrix thread root for a given incoming event using the
-/// priority defined in the Matrix spec:
+/// Determine the Matrix thread root for a given incoming event:
 ///
 /// 1. Event is already in a thread (`m.thread`) → use that thread's root.
-/// 2. Event is a plain reply (`m.in_reply_to`) → treat the replied-to event
-///    as the root (avoids a round-trip to fetch and inspect the parent).
-/// 3. Otherwise → this event starts a new thread; use its own event_id.
+/// 2. Event is a plain reply or standalone → start a new thread on this event itself.
 fn resolve_thread_root(event: &OriginalSyncRoomMessageEvent) -> OwnedEventId {
     match &event.content.relates_to {
         Some(Relation::Thread(thread)) => thread.event_id.clone(),
-        Some(Relation::Reply(reply)) => reply.in_reply_to.event_id.clone(),
         _ => event.event_id.clone(),
     }
 }
