@@ -8,8 +8,8 @@ name = "translate-bot"
 path = "src/main.rs"
 
 [dependencies]
-matrix-sdk = { version = "0.17", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
-matrix-sdk-crypto = "0.17"
+matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
+matrix-sdk-crypto = "0.18"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
