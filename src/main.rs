@@ -44,7 +44,7 @@ use matrix_sdk::{
             room::{
                 member::StrippedRoomMemberEvent,
                 message::{
-                    MessageType, OriginalSyncRoomMessageEvent,
+                    MessageType, NoticeMessageEventContent, OriginalSyncRoomMessageEvent,
                     Relation, RoomMessageEventContent,
                     RoomMessageEventContentWithoutRelation, TextMessageEventContent,
                 },
@@ -83,6 +83,10 @@ struct TranslationConfig {
     /// Set to false to post as a plain room message instead.
     #[serde(default = "default_true")]
     thread_replies: bool,
+    /// Send translations as `m.notice` (non-notifying) instead of `m.text` (default: false).
+    /// Most Matrix clients render notices with muted styling and suppress push notifications.
+    #[serde(default)]
+    silent_messages: bool,
 }
 
 fn default_langs() -> Vec<String> {
@@ -97,7 +101,12 @@ fn default_true() -> bool { true }
 
 impl Default for TranslationConfig {
     fn default() -> Self {
-        Self { langs: default_langs(), min_confidence: default_min_confidence(), thread_replies: true }
+        Self {
+            langs: default_langs(),
+            min_confidence: default_min_confidence(),
+            thread_replies: true,
+            silent_messages: false,
+        }
     }
 }
 
@@ -137,6 +146,7 @@ struct BotState {
     langs: Vec<String>,
     min_confidence: f64,
     thread_replies: bool,
+    silent_messages: bool,
     http: reqwest::Client,
     bot_user_id: OwnedUserId,
     admin_users: HashSet<OwnedUserId>,
@@ -237,6 +247,7 @@ async fn main() -> Result<()> {
         langs: config.translation.langs,
         min_confidence: config.translation.min_confidence,
         thread_replies: config.translation.thread_replies,
+        silent_messages: config.translation.silent_messages,
         http: reqwest::Client::new(),
         bot_user_id: user_id,
         admin_users,
@@ -503,6 +514,28 @@ mod tests {
         let plain = html_to_plain(&render_html("a & b < c > d"));
         assert_eq!(plain, "a & b < c > d");
     }
+
+    #[test]
+    fn make_translation_content_text_when_not_silent() {
+        let content = make_translation_content("hello".into(), "<p>hello</p>".into(), false);
+        assert!(matches!(content.msgtype, MessageType::Text(_)));
+    }
+
+    #[test]
+    fn make_translation_content_notice_when_silent() {
+        let content = make_translation_content("hello".into(), "<p>hello</p>".into(), true);
+        assert!(matches!(content.msgtype, MessageType::Notice(_)));
+    }
+
+    #[test]
+    fn make_translation_content_preserves_body() {
+        let content = make_translation_content("plain text".into(), "<b>bold</b>".into(), true);
+        let body = match &content.msgtype {
+            MessageType::Notice(n) => n.body.clone(),
+            _ => panic!("expected Notice"),
+        };
+        assert_eq!(body, "plain text");
+    }
 }
 
 
@@ -584,6 +617,17 @@ async fn translate_message(
     }
 }
 
+/// Build a translated message content with the right msgtype.
+/// `silent = true` → `m.notice` (suppressed push, muted styling in most clients).
+/// `silent = false` → `m.text` (default behaviour).
+fn make_translation_content(plain: String, html: String, silent: bool) -> RoomMessageEventContent {
+    if silent {
+        RoomMessageEventContent::notice_html(plain, html)
+    } else {
+        RoomMessageEventContent::text_html(plain, html)
+    }
+}
+
 async fn handle_image_caption(
     state: BotState,
     room: Room,
@@ -614,7 +658,7 @@ async fn handle_image_caption(
     }
 
     let plain_body = plain_lines.join("\n");
-    let mut content = RoomMessageEventContent::text_html(plain_body, html_lines.join("<br>\n"));
+    let mut content = make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
 
     if state.thread_replies {
         let thread_root = resolve_thread_root(&event);
@@ -711,7 +755,7 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
     }
 
     let plain_body = plain_lines.join("\n");
-    let mut content = RoomMessageEventContent::text_html(plain_body, html_lines.join("<br>\n"));
+    let mut content = make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
 
     if state.thread_replies {
         let thread_root = resolve_thread_root(&event);
@@ -799,10 +843,14 @@ async fn handle_edit(
 
     // Build m.replace pointing at the bot's existing translation event.
     // The thread membership is inherited from bot_event_id — no thread relation needed here.
-    let new_without = RoomMessageEventContentWithoutRelation::new(
-        MessageType::Text(TextMessageEventContent::html(new_body.clone(), new_html.clone())),
-    );
-    let mut edit_content = RoomMessageEventContent::text_html(format!("* {new_body}"), new_html);
+    // Preserve the same msgtype (m.notice vs m.text) as the original translation.
+    let inner_msgtype = if state.silent_messages {
+        MessageType::Notice(NoticeMessageEventContent::html(new_body.clone(), new_html.clone()))
+    } else {
+        MessageType::Text(TextMessageEventContent::html(new_body.clone(), new_html.clone()))
+    };
+    let new_without = RoomMessageEventContentWithoutRelation::new(inner_msgtype);
+    let mut edit_content = make_translation_content(format!("* {new_body}"), new_html, state.silent_messages);
     edit_content.relates_to = Some(Relation::Replacement(Replacement::new(
         bot_event_id.clone(),
         new_without,
