@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use mxbot_common::config::{MatrixConfig, SecurityConfig};
@@ -36,7 +36,7 @@ use matrix_sdk::{
     Client, Room, RoomState,
     config::SyncSettings,
     ruma::{
-        OwnedEventId, OwnedServerName, OwnedUserId, RoomOrAliasId,
+        MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedServerName, OwnedUserId, RoomOrAliasId,
         api::client::filter::FilterDefinition,
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
@@ -91,6 +91,11 @@ struct TranslationConfig {
     /// Most Matrix clients render notices with muted styling and suppress push notifications.
     #[serde(default)]
     silent_messages: bool,
+    /// Only translate messages received within this many seconds of the current time (default: 60).
+    /// Messages older than this window are silently ignored, preventing backlog translation
+    /// after restarts or outages.
+    #[serde(default = "default_translation_window")]
+    translation_window_seconds: u64,
 }
 
 fn default_langs() -> Vec<String> {
@@ -103,6 +108,8 @@ fn default_min_confidence() -> f64 {
 
 fn default_true() -> bool { true }
 
+fn default_translation_window() -> u64 { 180 }
+
 impl Default for TranslationConfig {
     fn default() -> Self {
         Self {
@@ -111,6 +118,7 @@ impl Default for TranslationConfig {
             reply_to_original: true,
             thread_replies: true,
             silent_messages: false,
+            translation_window_seconds: default_translation_window(),
         }
     }
 }
@@ -160,6 +168,7 @@ struct BotState {
     // Users allowed to re-verify despite already having a verified device.
     // Populated by !reset-trust from an admin, cleared after use.
     reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
+    translation_window_secs: u64,
     // Maps user's original event_id → bot's translation event_id.
     // Used to edit the bot's translation when the user edits their message.
     translation_map: Arc<RwLock<HashMap<OwnedEventId, OwnedEventId>>>,
@@ -255,6 +264,7 @@ async fn main() -> Result<()> {
         reply_to_original: config.translation.reply_to_original,
         thread_replies: config.translation.thread_replies,
         silent_messages: config.translation.silent_messages,
+        translation_window_secs: config.translation.translation_window_seconds,
         http: reqwest::Client::new(),
         bot_user_id: user_id,
         admin_users,
@@ -599,9 +609,58 @@ mod tests {
     #[test]
     fn default_translation_config() {
         let cfg = TranslationConfig::default();
-        assert!(cfg.reply_to_original, "default: reply_to_original must be true");
-        assert!(cfg.thread_replies,    "default: thread_replies must be true");
-        assert!(!cfg.silent_messages,  "default: silent_messages must be false");
+        assert!(cfg.reply_to_original,         "default: reply_to_original must be true");
+        assert!(cfg.thread_replies,            "default: thread_replies must be true");
+        assert!(!cfg.silent_messages,          "default: silent_messages must be false");
+        assert_eq!(cfg.translation_window_seconds, 180, "default: translation_window_seconds must be 180");
+    }
+
+    #[test]
+    fn window_accepts_current_event() {
+        assert!(is_within_window(MilliSecondsSinceUnixEpoch::now(), 60));
+    }
+
+    #[test]
+    fn window_rejects_old_event() {
+        // Unix epoch is billions of seconds old — always outside any reasonable window.
+        let ancient = MilliSecondsSinceUnixEpoch::from_system_time(SystemTime::UNIX_EPOCH)
+            .expect("UNIX_EPOCH is a valid timestamp");
+        assert!(!is_within_window(ancient, 60));
+    }
+
+    #[test]
+    fn window_accepts_future_event() {
+        // Events slightly in the future (clock skew) must not be rejected.
+        let future = SystemTime::now() + Duration::from_secs(5);
+        if let Some(ts) = MilliSecondsSinceUnixEpoch::from_system_time(future) {
+            assert!(is_within_window(ts, 60));
+        }
+    }
+
+    #[test]
+    fn window_boundary_exactly_at_limit() {
+        // An event exactly window_secs seconds old must be accepted (inclusive bound).
+        let exactly_at_limit = SystemTime::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if let Some(ts) = MilliSecondsSinceUnixEpoch::from_system_time(exactly_at_limit) {
+            assert!(is_within_window(ts, 60));
+        }
+    }
+
+    #[test]
+    fn serde_translation_window_explicit() {
+        let toml = r#"langs = ["en", "de"]
+translation_window_seconds = 120"#;
+        let cfg: TranslationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.translation_window_seconds, 120);
+    }
+
+    #[test]
+    fn serde_translation_window_missing_defaults_to_60() {
+        let toml = r#"langs = ["en", "de"]"#;
+        let cfg: TranslationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.translation_window_seconds, 180);
     }
 
     // ── Serde / default-value proof ───────────────────────────────────────────
@@ -942,6 +1001,14 @@ async fn handle_image_caption(
 }
 
 async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMessageEvent) {
+    if !is_within_window(event.origin_server_ts, state.translation_window_secs) {
+        info!(
+            "Skipping message {} from {} — outside {}s translation window",
+            event.event_id, event.sender, state.translation_window_secs
+        );
+        return;
+    }
+
     // Edits arrive as m.replace — route them to handle_edit and stop.
     // Must be checked BEFORE the msgtype guard: the top-level body of an edit
     // is only a fallback ("* new text") for old clients and must NOT be translated.
@@ -1047,6 +1114,17 @@ fn resolve_thread_root(event: &OriginalSyncRoomMessageEvent) -> OwnedEventId {
     match &event.content.relates_to {
         Some(Relation::Thread(thread)) => thread.event_id.clone(),
         _ => event.event_id.clone(),
+    }
+}
+
+/// Returns true if the event timestamp falls within the configured translation window.
+/// Events older than `window_secs` seconds are rejected to avoid translating backlog
+/// after restarts or outages. Future timestamps (clock skew) are accepted.
+fn is_within_window(ts: MilliSecondsSinceUnixEpoch, window_secs: u64) -> bool {
+    let Some(event_time) = ts.to_system_time() else { return false };
+    match SystemTime::now().duration_since(event_time) {
+        Ok(age) => age.as_secs() <= window_secs,
+        Err(_)  => true, // event is in the future — accept (clock skew)
     }
 }
 
