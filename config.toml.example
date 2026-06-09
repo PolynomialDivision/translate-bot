@@ -26,8 +26,14 @@ api_key = "YOUR_API_KEY"
 langs = ["en", "de", "uk"]
 # Minimum detection confidence to attempt translation (0.0–1.0)
 min_confidence = 0.5
-# Post translations inside the Matrix thread of the original message (default: true).
-# Set to false to post as a plain room message instead.
+# Whether the translation references the original message at all (default: true).
+# true  → translation is a reply (or thread reply) to the original message
+# false → translation is posted as a standalone message, no relation
+# reply_to_original = true
+# When reply_to_original = true: use m.thread instead of m.in_reply_to (default: true).
+# true  → m.thread relation (translation appears in the thread panel in Element/FluffyChat)
+# false → m.in_reply_to relation (normal Matrix quote-reply)
+# Has no effect when reply_to_original = false.
 # thread_replies = true
 # Send translations as m.notice instead of m.text (default: false).
 # m.notice messages are rendered with muted styling in most clients and do not

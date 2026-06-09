@@ -40,12 +40,12 @@ use matrix_sdk::{
         api::client::filter::FilterDefinition,
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
-            relation::{Replacement, Thread},
+            relation::{InReplyTo, Replacement, Reply, Thread},
             room::{
                 member::StrippedRoomMemberEvent,
                 message::{
-                    MessageType, NoticeMessageEventContent, OriginalSyncRoomMessageEvent,
-                    Relation, RoomMessageEventContent,
+                    MessageType, NoticeMessageEventContent,
+                    OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
                     RoomMessageEventContentWithoutRelation, TextMessageEventContent,
                 },
                 redaction::OriginalSyncRoomRedactionEvent,
@@ -79,8 +79,12 @@ struct TranslationConfig {
     langs: Vec<String>,
     #[serde(default = "default_min_confidence")]
     min_confidence: f64,
-    /// Post translations inside the Matrix thread of the original message (default: true).
-    /// Set to false to post as a plain room message instead.
+    /// Whether translations reference the original message at all (default: true).
+    /// When false, translations are posted as standalone messages regardless of thread_replies.
+    #[serde(default = "default_true")]
+    reply_to_original: bool,
+    /// When reply_to_original = true: use m.thread instead of m.in_reply_to (default: true).
+    /// When reply_to_original = false: has no effect.
     #[serde(default = "default_true")]
     thread_replies: bool,
     /// Send translations as `m.notice` (non-notifying) instead of `m.text` (default: false).
@@ -104,6 +108,7 @@ impl Default for TranslationConfig {
         Self {
             langs: default_langs(),
             min_confidence: default_min_confidence(),
+            reply_to_original: true,
             thread_replies: true,
             silent_messages: false,
         }
@@ -145,6 +150,7 @@ struct BotState {
     lt_api_key: Option<String>,
     langs: Vec<String>,
     min_confidence: f64,
+    reply_to_original: bool,
     thread_replies: bool,
     silent_messages: bool,
     http: reqwest::Client,
@@ -246,6 +252,7 @@ async fn main() -> Result<()> {
         lt_api_key: config.libretranslate.api_key,
         langs: config.translation.langs,
         min_confidence: config.translation.min_confidence,
+        reply_to_original: config.translation.reply_to_original,
         thread_replies: config.translation.thread_replies,
         silent_messages: config.translation.silent_messages,
         http: reqwest::Client::new(),
@@ -536,6 +543,247 @@ mod tests {
         };
         assert_eq!(body, "plain text");
     }
+
+    // ── make_relation tests ───────────────────────────────────────────────────
+
+    fn eid(s: &str) -> OwnedEventId {
+        matrix_sdk::ruma::EventId::parse(s).unwrap()
+    }
+
+    #[test]
+    fn relation_standalone_when_reply_to_original_false() {
+        let id = eid("$ev1:example.org");
+        assert!(make_relation(&id, &id, false, false).is_none());
+    }
+
+    #[test]
+    fn relation_standalone_when_reply_to_original_false_thread_true() {
+        let id = eid("$ev2:example.org");
+        assert!(make_relation(&id, &id, false, true).is_none(),
+            "thread_replies=true must not override reply_to_original=false");
+    }
+
+    #[test]
+    fn relation_reply_when_reply_true_thread_false() {
+        let id = eid("$ev3:example.org");
+        assert!(matches!(make_relation(&id, &id, true, false), Some(Relation::Reply(_))));
+    }
+
+    #[test]
+    fn relation_thread_when_reply_true_thread_true() {
+        let id = eid("$ev4:example.org");
+        assert!(matches!(make_relation(&id, &id, true, true), Some(Relation::Thread(_))));
+    }
+
+    #[test]
+    fn relation_reply_points_to_event_id() {
+        let id = eid("$ev5:example.org");
+        let Some(Relation::Reply(r)) = make_relation(&id, &id, true, false) else {
+            panic!("expected Reply");
+        };
+        assert_eq!(r.in_reply_to.event_id, id);
+    }
+
+    #[test]
+    fn relation_thread_uses_thread_root() {
+        let event_id   = eid("$reply:example.org");
+        let root_id    = eid("$root:example.org");
+        let Some(Relation::Thread(t)) = make_relation(&event_id, &root_id, true, true) else {
+            panic!("expected Thread");
+        };
+        assert_eq!(t.event_id, root_id,  "thread root must be root_id");
+        // in_reply_to inside the thread must point to the translated event itself
+        assert_eq!(t.in_reply_to.as_ref().map(|r| &r.event_id), Some(&event_id));
+    }
+
+    #[test]
+    fn default_translation_config() {
+        let cfg = TranslationConfig::default();
+        assert!(cfg.reply_to_original, "default: reply_to_original must be true");
+        assert!(cfg.thread_replies,    "default: thread_replies must be true");
+        assert!(!cfg.silent_messages,  "default: silent_messages must be false");
+    }
+
+    // ── Serde / default-value proof ───────────────────────────────────────────
+    //
+    // These tests prove the exact path taken when reply_to_original is absent
+    // from config:
+    //
+    //   1. Key present with explicit value → used as-is.
+    //   2. Key absent from [translation] section → serde calls default_true().
+    //   3. [translation] section absent entirely → Config field has
+    //      #[serde(default)] so TranslationConfig::default() is called,
+    //      which also sets reply_to_original = true.
+
+    #[test]
+    fn serde_reply_to_original_explicit_false() {
+        let toml = r#"langs = ["en", "de"]
+reply_to_original = false"#;
+        let cfg: TranslationConfig = toml::from_str(toml).unwrap();
+        assert!(!cfg.reply_to_original);
+    }
+
+    #[test]
+    fn serde_reply_to_original_explicit_true() {
+        let toml = r#"langs = ["en", "de"]
+reply_to_original = true"#;
+        let cfg: TranslationConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.reply_to_original);
+    }
+
+    #[test]
+    fn serde_reply_to_original_missing_key_defaults_to_true() {
+        // Key is absent — serde invokes the #[serde(default = "default_true")] path.
+        let toml = r#"langs = ["en", "de"]"#;
+        let cfg: TranslationConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.reply_to_original,
+            "absent key must default to true via default_true()");
+    }
+
+    #[test]
+    fn serde_entire_translation_section_missing_defaults_to_true() {
+        // Simulates a config.toml with no [translation] section at all.
+        // Config has #[serde(default)] on the translation field, which calls
+        // TranslationConfig::default() → reply_to_original = true.
+        let cfg = TranslationConfig::default();
+        assert!(cfg.reply_to_original,
+            "TranslationConfig::default() must set reply_to_original = true");
+    }
+
+    // ── Exact serialized Matrix event JSON ────────────────────────────────────
+    //
+    // These tests serialize actual RoomMessageEventContent values and assert
+    // the exact JSON shape that the Matrix homeserver will receive and forward
+    // to other clients.  This is the ground truth for client compatibility.
+
+    fn content_with_relation(reply_to_original: bool, thread_replies: bool) -> serde_json::Value {
+        let event_id  = eid("$original:example.org");
+        let thread_root = eid("$root:example.org");
+        let mut content = make_translation_content("🇬🇧 Hello".into(), "🇬🇧 Hello".into(), false);
+        content.relates_to = make_relation(&event_id, &thread_root, reply_to_original, thread_replies);
+        serde_json::to_value(&content).unwrap()
+    }
+
+    #[test]
+    fn json_standalone_has_no_relates_to() {
+        // reply_to_original=false → no relation field at all.
+        // Expected JSON:
+        //   { "msgtype": "m.text", "body": "...", "format": "...", "formatted_body": "..." }
+        let json = content_with_relation(false, false);
+        assert!(json.get("m.relates_to").is_none(),
+            "standalone must have no m.relates_to field; got: {json}");
+    }
+
+    #[test]
+    fn json_reply_shape() {
+        // reply_to_original=true, thread_replies=false → m.in_reply_to reply.
+        // Expected JSON fragment:
+        //   "m.relates_to": {
+        //     "m.in_reply_to": { "event_id": "$original:example.org" }
+        //   }
+        // Note: no "rel_type" key — pure replies do not have rel_type per Matrix spec.
+        let json = content_with_relation(true, false);
+        let rel  = &json["m.relates_to"];
+        assert!(!rel.is_null(), "m.relates_to must be present");
+        assert!(rel.get("rel_type").is_none(),
+            "plain reply must not have rel_type; got: {rel}");
+        assert_eq!(rel["m.in_reply_to"]["event_id"], "$original:example.org",
+            "in_reply_to must point to $original:example.org");
+    }
+
+    #[test]
+    fn json_thread_shape() {
+        // reply_to_original=true, thread_replies=true → m.thread.
+        // Expected JSON fragment:
+        //   "m.relates_to": {
+        //     "rel_type":      "m.thread",
+        //     "event_id":      "$root:example.org",
+        //     "m.in_reply_to": { "event_id": "$original:example.org" }
+        //   }
+        //
+        // Note: ruma omits is_falling_back from the JSON when it is false
+        // (#[serde(skip_serializing_if = "is_default")]).  Per the Matrix spec,
+        // an absent is_falling_back is equivalent to false — a genuine thread
+        // reply.  is_falling_back only appears in the JSON when true (fallback).
+        let json = content_with_relation(true, true);
+        let rel  = &json["m.relates_to"];
+        assert_eq!(rel["rel_type"],  "m.thread",             "rel_type must be m.thread");
+        assert_eq!(rel["event_id"],  "$root:example.org",    "event_id must be thread root");
+        assert_eq!(rel["m.in_reply_to"]["event_id"], "$original:example.org",
+            "in_reply_to inside thread must point to translated event");
+        assert!(rel.get("is_falling_back").is_none(),
+            "is_falling_back=false is omitted by ruma (absent == false per Matrix spec); \
+             if it appears it means ruma set it to true unexpectedly: {rel}");
+    }
+
+    // ── Image caption path integration ───────────────────────────────────────
+    //
+    // handle_image_caption() builds its relation with exactly:
+    //
+    //   let thread_root = resolve_thread_root(&event);
+    //   content.relates_to = make_relation(
+    //       &event.event_id, &thread_root,
+    //       state.reply_to_original, state.thread_replies,
+    //   );
+    //
+    // This is the same call as handle_message().  The tests below reproduce
+    // that call sequence directly, proving both paths exercise the same logic.
+    //
+    // resolve_thread_root() returns:
+    //   - event.event_id   when the event is NOT already in a thread
+    //   - thread.event_id  when the event IS already in a thread
+    //
+    // Case A: caption event is a standalone message (not in a thread).
+    // resolve_thread_root returns event_id → thread_root == event_id.
+
+    #[test]
+    fn image_caption_standalone_event_reply_relation() {
+        let caption_event_id = eid("$caption:example.org");
+        // resolve_thread_root for a non-threaded event returns event_id itself
+        let thread_root = caption_event_id.clone();
+
+        let mut content = make_translation_content("🇩🇪 Hallo".into(), "🇩🇪 Hallo".into(), false);
+        content.relates_to = make_relation(&caption_event_id, &thread_root, true, false);
+
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json["m.relates_to"].get("rel_type").is_none(),
+            "caption reply must not have rel_type");
+        assert_eq!(json["m.relates_to"]["m.in_reply_to"]["event_id"],
+            "$caption:example.org");
+    }
+
+    // Case B: caption event is already inside a thread.
+    // resolve_thread_root returns thread.event_id (the root), NOT event_id.
+
+    #[test]
+    fn image_caption_threaded_event_thread_relation() {
+        let thread_root_id   = eid("$thread_root:example.org");
+        let caption_event_id = eid("$caption_in_thread:example.org");
+        // resolve_thread_root would return thread_root_id in this case
+        let thread_root = thread_root_id.clone();
+
+        let mut content = make_translation_content("🇩🇪 Hallo".into(), "🇩🇪 Hallo".into(), false);
+        content.relates_to = make_relation(&caption_event_id, &thread_root, true, true);
+
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["m.relates_to"]["rel_type"],  "m.thread");
+        assert_eq!(json["m.relates_to"]["event_id"],  "$thread_root:example.org");
+        assert_eq!(json["m.relates_to"]["m.in_reply_to"]["event_id"],
+            "$caption_in_thread:example.org");
+    }
+
+    #[test]
+    fn image_caption_standalone_produces_no_relation_when_reply_to_original_false() {
+        let caption_event_id = eid("$caption2:example.org");
+        let thread_root = caption_event_id.clone();
+
+        let mut content = make_translation_content("🇩🇪 Hallo".into(), "🇩🇪 Hallo".into(), false);
+        content.relates_to = make_relation(&caption_event_id, &thread_root, false, false);
+
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.get("m.relates_to").is_none(),
+            "caption with reply_to_original=false must produce no relation");
+    }
 }
 
 
@@ -617,6 +865,32 @@ async fn translate_message(
     }
 }
 
+/// Compute the `relates_to` relation for a translation message.
+///
+/// | reply_to_original | thread_replies | result              |
+/// |-------------------|----------------|---------------------|
+/// | false             | *              | None (standalone)   |
+/// | true              | false          | m.in_reply_to reply |
+/// | true              | true           | m.thread            |
+///
+/// `event_id`    – the event being translated (used as reply target / thread in_reply_to).
+/// `thread_root` – the thread root to use; pass `resolve_thread_root(event)` at call sites.
+fn make_relation(
+    event_id: &OwnedEventId,
+    thread_root: &OwnedEventId,
+    reply_to_original: bool,
+    thread_replies: bool,
+) -> Option<Relation<RoomMessageEventContentWithoutRelation>> {
+    if !reply_to_original {
+        return None;
+    }
+    if thread_replies {
+        Some(Relation::Thread(Thread::reply(thread_root.clone(), event_id.clone())))
+    } else {
+        Some(Relation::Reply(Reply::new(InReplyTo::new(event_id.clone()))))
+    }
+}
+
 /// Build a translated message content with the right msgtype.
 /// `silent = true` → `m.notice` (suppressed push, muted styling in most clients).
 /// `silent = false` → `m.text` (default behaviour).
@@ -659,14 +933,8 @@ async fn handle_image_caption(
 
     let plain_body = plain_lines.join("\n");
     let mut content = make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
-
-    if state.thread_replies {
-        let thread_root = resolve_thread_root(&event);
-        content.relates_to = Some(Relation::Thread(Thread::reply(
-            thread_root,
-            event.event_id.clone(),
-        )));
-    }
+    let thread_root = resolve_thread_root(&event);
+    content.relates_to = make_relation(&event.event_id, &thread_root, state.reply_to_original, state.thread_replies);
 
     if let Err(e) = room.send(content).await {
         error!("Failed to send image caption translation: {e}");
@@ -756,17 +1024,11 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
 
     let plain_body = plain_lines.join("\n");
     let mut content = make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
-
-    if state.thread_replies {
-        let thread_root = resolve_thread_root(&event);
+    let thread_root = resolve_thread_root(&event);
+    if state.reply_to_original && state.thread_replies {
         info!("thread_root={} for event={}", thread_root, event.event_id);
-        // reply_to = event.event_id so the translation quotes the specific
-        // message it translated, not always the thread root.
-        content.relates_to = Some(Relation::Thread(Thread::reply(
-            thread_root,
-            event.event_id.clone(),
-        )));
     }
+    content.relates_to = make_relation(&event.event_id, &thread_root, state.reply_to_original, state.thread_replies);
 
     match room.send(content).await {
         Ok(resp) => {
