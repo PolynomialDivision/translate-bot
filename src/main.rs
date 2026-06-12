@@ -559,32 +559,46 @@ mod tests {
     #[test]
     fn relation_standalone_when_reply_to_original_false() {
         let id = eid("$ev1:example.org");
-        assert!(make_relation(&id, &id, false, false).is_none());
+        assert!(make_relation(&id, &id, false, false, false).is_none());
     }
 
     #[test]
     fn relation_standalone_when_reply_to_original_false_thread_true() {
         let id = eid("$ev2:example.org");
-        assert!(make_relation(&id, &id, false, true).is_none(),
+        assert!(make_relation(&id, &id, false, true, false).is_none(),
             "thread_replies=true must not override reply_to_original=false");
     }
 
     #[test]
-    fn relation_reply_when_reply_true_thread_false() {
+    fn relation_reply_when_reply_true_thread_false_not_in_thread() {
         let id = eid("$ev3:example.org");
-        assert!(matches!(make_relation(&id, &id, true, false), Some(Relation::Reply(_))));
+        assert!(matches!(make_relation(&id, &id, true, false, false), Some(Relation::Reply(_))));
     }
 
     #[test]
     fn relation_thread_when_reply_true_thread_true() {
         let id = eid("$ev4:example.org");
-        assert!(matches!(make_relation(&id, &id, true, true), Some(Relation::Thread(_))));
+        assert!(matches!(make_relation(&id, &id, true, true, false), Some(Relation::Thread(_))));
+    }
+
+    #[test]
+    fn relation_thread_when_in_thread_even_if_thread_replies_false() {
+        // Key regression test: thread_replies=false must NOT pull the bot out of
+        // an existing thread.  If the original message is already in a thread,
+        // the translation must always be a thread reply into that same thread.
+        let event_id = eid("$reply_in_thread:example.org");
+        let root_id  = eid("$root:example.org");
+        let Some(Relation::Thread(t)) = make_relation(&event_id, &root_id, true, false, true) else {
+            panic!("expected Thread when in_thread=true regardless of thread_replies");
+        };
+        assert_eq!(t.event_id, root_id);
+        assert_eq!(t.in_reply_to.as_ref().map(|r| &r.event_id), Some(&event_id));
     }
 
     #[test]
     fn relation_reply_points_to_event_id() {
         let id = eid("$ev5:example.org");
-        let Some(Relation::Reply(r)) = make_relation(&id, &id, true, false) else {
+        let Some(Relation::Reply(r)) = make_relation(&id, &id, true, false, false) else {
             panic!("expected Reply");
         };
         assert_eq!(r.in_reply_to.event_id, id);
@@ -594,7 +608,7 @@ mod tests {
     fn relation_thread_uses_thread_root() {
         let event_id   = eid("$reply:example.org");
         let root_id    = eid("$root:example.org");
-        let Some(Relation::Thread(t)) = make_relation(&event_id, &root_id, true, true) else {
+        let Some(Relation::Thread(t)) = make_relation(&event_id, &root_id, true, true, false) else {
             panic!("expected Thread");
         };
         assert_eq!(t.event_id, root_id,  "thread root must be root_id");
@@ -666,7 +680,7 @@ reply_to_original = true"#;
         let event_id  = eid("$original:example.org");
         let thread_root = eid("$root:example.org");
         let mut content = make_translation_content("🇬🇧 Hello".into(), "🇬🇧 Hello".into(), false);
-        content.relates_to = make_relation(&event_id, &thread_root, reply_to_original, thread_replies);
+        content.relates_to = make_relation(&event_id, &thread_root, reply_to_original, thread_replies, false);
         serde_json::to_value(&content).unwrap()
     }
 
@@ -749,7 +763,7 @@ reply_to_original = true"#;
         let thread_root = caption_event_id.clone();
 
         let mut content = make_translation_content("🇩🇪 Hallo".into(), "🇩🇪 Hallo".into(), false);
-        content.relates_to = make_relation(&caption_event_id, &thread_root, true, false);
+        content.relates_to = make_relation(&caption_event_id, &thread_root, true, false, false);
 
         let json = serde_json::to_value(&content).unwrap();
         assert!(json["m.relates_to"].get("rel_type").is_none(),
@@ -760,6 +774,7 @@ reply_to_original = true"#;
 
     // Case B: caption event is already inside a thread.
     // resolve_thread_root returns thread.event_id (the root), NOT event_id.
+    // Even with thread_replies=false the bot must stay in the thread (in_thread=true).
 
     #[test]
     fn image_caption_threaded_event_thread_relation() {
@@ -769,7 +784,8 @@ reply_to_original = true"#;
         let thread_root = thread_root_id.clone();
 
         let mut content = make_translation_content("🇩🇪 Hallo".into(), "🇩🇪 Hallo".into(), false);
-        content.relates_to = make_relation(&caption_event_id, &thread_root, true, true);
+        // in_thread=true mirrors what handle_image_caption now passes
+        content.relates_to = make_relation(&caption_event_id, &thread_root, true, false, true);
 
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json["m.relates_to"]["rel_type"],  "m.thread");
@@ -784,7 +800,7 @@ reply_to_original = true"#;
         let thread_root = caption_event_id.clone();
 
         let mut content = make_translation_content("🇩🇪 Hallo".into(), "🇩🇪 Hallo".into(), false);
-        content.relates_to = make_relation(&caption_event_id, &thread_root, false, false);
+        content.relates_to = make_relation(&caption_event_id, &thread_root, false, false, false);
 
         let json = serde_json::to_value(&content).unwrap();
         assert!(json.get("m.relates_to").is_none(),
@@ -873,11 +889,17 @@ async fn translate_message(
 
 /// Compute the `relates_to` relation for a translation message.
 ///
-/// | reply_to_original | thread_replies | result              |
-/// |-------------------|----------------|---------------------|
-/// | false             | *              | None (standalone)   |
-/// | true              | false          | m.in_reply_to reply |
-/// | true              | true           | m.thread            |
+/// | reply_to_original | in_thread | thread_replies | result              |
+/// |-------------------|-----------|----------------|---------------------|
+/// | false             | *         | *              | None (standalone)   |
+/// | true              | true      | *              | m.thread            |
+/// | true              | false     | false          | m.in_reply_to reply |
+/// | true              | false     | true           | m.thread            |
+///
+/// `in_thread` — whether the original event is already inside a thread.
+///   When true the bot always thread-replies into that same thread, regardless
+///   of `thread_replies` config.  `thread_replies = false` only suppresses the
+///   bot from *opening* new threads on standalone messages.
 ///
 /// `event_id`    – the event being translated (used as reply target / thread in_reply_to).
 /// `thread_root` – the thread root to use; pass `resolve_thread_root(event)` at call sites.
@@ -886,11 +908,12 @@ fn make_relation(
     thread_root: &OwnedEventId,
     reply_to_original: bool,
     thread_replies: bool,
+    in_thread: bool,
 ) -> Option<Relation<RoomMessageEventContentWithoutRelation>> {
     if !reply_to_original {
         return None;
     }
-    if thread_replies {
+    if in_thread || thread_replies {
         Some(Relation::Thread(Thread::reply(thread_root.clone(), event_id.clone())))
     } else {
         Some(Relation::Reply(Reply::new(InReplyTo::new(event_id.clone()))))
@@ -939,8 +962,9 @@ async fn handle_image_caption(
 
     let plain_body = plain_lines.join("\n");
     let mut content = make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
+    let in_thread = matches!(&event.content.relates_to, Some(Relation::Thread(_)));
     let thread_root = resolve_thread_root(&event);
-    content.relates_to = make_relation(&event.event_id, &thread_root, state.reply_to_original, state.thread_replies);
+    content.relates_to = make_relation(&event.event_id, &thread_root, state.reply_to_original, state.thread_replies, in_thread);
 
     if let Err(e) = room.send(content).await {
         error!("Failed to send image caption translation: {e}");
@@ -1040,11 +1064,12 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
 
     let plain_body = plain_lines.join("\n");
     let mut content = make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
+    let in_thread = matches!(&event.content.relates_to, Some(Relation::Thread(_)));
     let thread_root = resolve_thread_root(&event);
-    if state.reply_to_original && state.thread_replies {
+    if state.reply_to_original && (state.thread_replies || in_thread) {
         info!("thread_root={} for event={}", thread_root, event.event_id);
     }
-    content.relates_to = make_relation(&event.event_id, &thread_root, state.reply_to_original, state.thread_replies);
+    content.relates_to = make_relation(&event.event_id, &thread_root, state.reply_to_original, state.thread_replies, in_thread);
 
     match room.send(content).await {
         Ok(resp) => {
