@@ -32,6 +32,7 @@ fn flag_for_lang(lang: &str) -> &'static str {
 use anyhow::Result;
 use pulldown_cmark::{Options, Parser};
 use pulldown_cmark::html::push_html;
+use futures_util::future::join_all;
 use matrix_sdk::{
     Client, Room, RoomState,
     config::SyncSettings,
@@ -44,7 +45,7 @@ use matrix_sdk::{
             room::{
                 member::StrippedRoomMemberEvent,
                 message::{
-                    MessageType, NoticeMessageEventContent,
+                    FormattedBody, MessageFormat, MessageType, NoticeMessageEventContent,
                     OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
                     RoomMessageEventContentWithoutRelation, TextMessageEventContent,
                 },
@@ -528,6 +529,74 @@ mod tests {
         assert_eq!(plain, "a & b < c > d");
     }
 
+    // ── strip_mx_reply tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn strip_mx_reply_removes_wrapper() {
+        let html = "<mx-reply><blockquote>quoted</blockquote></mx-reply>Actual message";
+        assert_eq!(strip_mx_reply(html), "Actual message");
+    }
+
+    #[test]
+    fn strip_mx_reply_passthrough_when_no_wrapper() {
+        let html = "<p>Normal message</p>";
+        assert_eq!(strip_mx_reply(html), html);
+    }
+
+    #[test]
+    fn strip_mx_reply_trims_leading_whitespace_after_removal() {
+        let html = "<mx-reply><blockquote>q</blockquote></mx-reply>\n\n<p>message</p>";
+        assert_eq!(strip_mx_reply(html), "<p>message</p>");
+    }
+
+    // ── blockquote stripping tests ────────────────────────────────────────────
+
+    #[test]
+    fn blockquote_strip_removes_leading_fallback_block() {
+        let raw = "> Alice said something\n> more quoted\n\nActual reply text";
+        let text: String = if raw.starts_with("> ") {
+            raw.lines()
+                .skip_while(|l| l.starts_with("> "))
+                .skip_while(|l| l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            raw.to_owned()
+        };
+        assert_eq!(text.trim(), "Actual reply text");
+    }
+
+    #[test]
+    fn blockquote_strip_preserves_mid_message_blockquotes() {
+        // A message that starts normally but has a blockquote mid-text should be untouched
+        let raw = "Here is my point:\n> some quote\nAnd my conclusion";
+        let text: String = if raw.starts_with("> ") {
+            raw.lines()
+                .skip_while(|l| l.starts_with("> "))
+                .skip_while(|l| l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            raw.to_owned()
+        };
+        assert_eq!(text, raw);
+    }
+
+    #[test]
+    fn blockquote_strip_passthrough_when_no_leading_quote() {
+        let raw = "Normal message without quotes";
+        let text: String = if raw.starts_with("> ") {
+            raw.lines()
+                .skip_while(|l| l.starts_with("> "))
+                .skip_while(|l| l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            raw.to_owned()
+        };
+        assert_eq!(text, raw);
+    }
+
     #[test]
     fn make_translation_content_text_when_not_silent() {
         let content = make_translation_content("hello".into(), "<p>hello</p>".into(), false);
@@ -863,28 +932,45 @@ fn html_to_plain(html: &str) -> String {
         .replace("&#39;", "'")
 }
 
-/// Translate a Markdown message by rendering it to HTML first, then sending
-/// the HTML to LibreTranslate in HTML mode (one call, full context preserved).
-/// LibreTranslate's HTML mode skips <code> and <pre> content automatically.
-///
-/// Returns `(plain_body, formatted_html)`.
-async fn translate_message(
+/// Strip the `<mx-reply>…</mx-reply>` fallback block that Matrix clients prepend
+/// to `formatted_body` when a message is a reply.  Returns the remaining HTML.
+fn strip_mx_reply(html: &str) -> String {
+    if let Some(start) = html.find("<mx-reply>") {
+        if let Some(rel_end) = html[start..].find("</mx-reply>") {
+            return html[start + rel_end + "</mx-reply>".len()..].trim_start().to_owned();
+        }
+    }
+    html.to_owned()
+}
+
+/// Core translation call: send pre-rendered HTML to LibreTranslate and return
+/// `(plain_body, formatted_html)`.  Used by both text and image-caption paths.
+async fn translate_html_content(
     state: &BotState,
-    markdown: &str,
+    html: &str,
     source: &str,
     target: &str,
 ) -> (String, String) {
-    let html_input = render_html(markdown);
-    match state.translate(&html_input, source, target, "html").await {
+    match state.translate(html, source, target, "html").await {
         Some(translated_html) => {
             let plain = html_to_plain(&translated_html);
             (plain, inline_html(&translated_html))
         }
         None => {
             warn!("Translation failed for target={target} — keeping original");
-            (markdown.to_owned(), inline_html(&html_input))
+            (html_to_plain(html), inline_html(html))
         }
     }
+}
+
+/// Convenience wrapper: render Markdown to HTML then translate.
+async fn translate_message(
+    state: &BotState,
+    markdown: &str,
+    source: &str,
+    target: &str,
+) -> (String, String) {
+    translate_html_content(state, &render_html(markdown), source, target).await
 }
 
 /// Compute the `relates_to` relation for a translation message.
@@ -951,11 +1037,13 @@ async fn handle_image_caption(
     let targets: Vec<&String> = state.langs.iter().filter(|t| t.as_str() != lang).collect();
     if targets.is_empty() { return; }
 
+    let results = join_all(
+        targets.iter().map(|target| translate_message(&state, &caption, &lang, target))
+    ).await;
     let mut plain_lines = Vec::new();
     let mut html_lines = Vec::new();
-    for target in &targets {
+    for (target, (plain, html)) in targets.iter().zip(results) {
         let flag = flag_for_lang(target);
-        let (plain, html) = translate_message(&state, &caption, &lang, target).await;
         plain_lines.push(format!("{flag} {plain}"));
         html_lines.push(format!("{flag} {html}"));
     }
@@ -1025,12 +1113,18 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         return;
     }
 
-    // Strip reply fallback lines from plain text
-    let text: String = raw
-        .lines()
-        .filter(|l| !l.starts_with("> "))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Strip the leading Matrix reply-fallback block: consecutive "> " lines at the top
+    // followed by a blank separator line.  Only the top block is removed so that
+    // intentional blockquotes later in the message are preserved.
+    let text: String = if raw.starts_with("> ") {
+        raw.lines()
+            .skip_while(|l| l.starts_with("> "))
+            .skip_while(|l| l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        raw.to_owned()
+    };
     let text = text.trim();
     if text.is_empty() {
         return;
@@ -1052,12 +1146,20 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         return;
     }
 
+    // Prefer formatted_body (already HTML — strip <mx-reply> wrapper for replies).
+    // Fall back to rendering the plain body as Markdown.
+    let html_to_translate = match &text_content.formatted {
+        Some(fb) if fb.format == MessageFormat::Html => strip_mx_reply(&fb.body),
+        _ => render_html(text),
+    };
+
+    let results = join_all(
+        targets.iter().map(|target| translate_html_content(&state, &html_to_translate, &lang, target))
+    ).await;
     let mut plain_lines = Vec::new();
     let mut html_lines = Vec::new();
-
-    for target in &targets {
+    for (target, (plain, html)) in targets.iter().zip(results) {
         let flag = flag_for_lang(target);
-        let (plain, html) = translate_message(&state, text, &lang, target).await;
         plain_lines.push(format!("{flag} {plain}"));
         html_lines.push(format!("{flag} {html}"));
     }
