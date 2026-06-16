@@ -950,15 +950,15 @@ async fn translate_html_content(
     html: &str,
     source: &str,
     target: &str,
-) -> (String, String) {
+) -> Option<(String, String)> {
     match state.translate(html, source, target, "html").await {
         Some(translated_html) => {
             let plain = html_to_plain(&translated_html);
-            (plain, inline_html(&translated_html))
+            Some((plain, inline_html(&translated_html)))
         }
         None => {
-            warn!("Translation failed for target={target} — keeping original");
-            (html_to_plain(html), inline_html(html))
+            warn!("Translation failed for target={target} — skipping");
+            None
         }
     }
 }
@@ -969,7 +969,7 @@ async fn translate_message(
     markdown: &str,
     source: &str,
     target: &str,
-) -> (String, String) {
+) -> Option<(String, String)> {
     translate_html_content(state, &render_html(markdown), source, target).await
 }
 
@@ -1042,11 +1042,15 @@ async fn handle_image_caption(
     ).await;
     let mut plain_lines = Vec::new();
     let mut html_lines = Vec::new();
-    for (target, (plain, html)) in targets.iter().zip(results) {
-        let flag = flag_for_lang(target);
-        plain_lines.push(format!("{flag} {plain}"));
-        html_lines.push(format!("{flag} {html}"));
+    for (target, result) in targets.iter().zip(results) {
+        if let Some((plain, html)) = result {
+            let flag = flag_for_lang(target);
+            plain_lines.push(format!("{flag} {plain}"));
+            html_lines.push(format!("{flag} {html}"));
+        }
     }
+
+    if plain_lines.is_empty() { return; }
 
     let plain_body = plain_lines.join("\n");
     let mut content = make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
@@ -1158,11 +1162,15 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
     ).await;
     let mut plain_lines = Vec::new();
     let mut html_lines = Vec::new();
-    for (target, (plain, html)) in targets.iter().zip(results) {
-        let flag = flag_for_lang(target);
-        plain_lines.push(format!("{flag} {plain}"));
-        html_lines.push(format!("{flag} {html}"));
+    for (target, result) in targets.iter().zip(results) {
+        if let Some((plain, html)) = result {
+            let flag = flag_for_lang(target);
+            plain_lines.push(format!("{flag} {plain}"));
+            html_lines.push(format!("{flag} {html}"));
+        }
     }
+
+    if plain_lines.is_empty() { return; }
 
     let plain_body = plain_lines.join("\n");
     let mut content = make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
@@ -1237,11 +1245,13 @@ async fn handle_edit(
     let mut plain_lines = Vec::new();
     let mut html_lines = Vec::new();
     for target in &targets {
-        let flag = flag_for_lang(target);
-        let (plain, html) = translate_message(&state, text, &lang, target).await;
-        plain_lines.push(format!("{flag} {plain}"));
-        html_lines.push(format!("{flag} {html}"));
+        if let Some((plain, html)) = translate_message(&state, text, &lang, target).await {
+            let flag = flag_for_lang(target);
+            plain_lines.push(format!("{flag} {plain}"));
+            html_lines.push(format!("{flag} {html}"));
+        }
     }
+    if plain_lines.is_empty() { return; }
 
     let new_body = plain_lines.join("\n");
     let new_html = html_lines.join("<br>\n");
