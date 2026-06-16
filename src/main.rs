@@ -45,7 +45,7 @@ use matrix_sdk::{
             room::{
                 member::StrippedRoomMemberEvent,
                 message::{
-                    FormattedBody, MessageFormat, MessageType, NoticeMessageEventContent,
+                    MessageFormat, MessageType, NoticeMessageEventContent,
                     OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
                     RoomMessageEventContentWithoutRelation, TextMessageEventContent,
                 },
