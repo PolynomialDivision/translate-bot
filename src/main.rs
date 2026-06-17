@@ -954,6 +954,10 @@ async fn translate_html_content(
     match state.translate(html, source, target, "html").await {
         Some(translated_html) => {
             let plain = html_to_plain(&translated_html);
+            if plain.is_empty() {
+                warn!("Translation to {target} produced empty text — skipping");
+                return None;
+            }
             Some((plain, inline_html(&translated_html)))
         }
         None => {
@@ -963,14 +967,35 @@ async fn translate_html_content(
     }
 }
 
-/// Convenience wrapper: render Markdown to HTML then translate.
+/// Try HTML translation first; if it produces empty output (e.g. model can't handle
+/// the language+HTML combo), fall back to translating `plain` as plain text.
+async fn translate_html_with_fallback(
+    state: &BotState,
+    html: &str,
+    plain: &str,
+    source: &str,
+    target: &str,
+) -> Option<(String, String)> {
+    if let Some(result) = translate_html_content(state, html, source, target).await {
+        return Some(result);
+    }
+    // Plain-text fallback — no formatting preserved, but at least we get a translation.
+    let translated = state.translate(plain, source, target, "text").await?;
+    let translated = translated.trim().to_owned();
+    if translated.is_empty() {
+        return None;
+    }
+    Some((translated.clone(), translated))
+}
+
+/// Convenience wrapper: render Markdown to HTML then translate, with plain-text fallback.
 async fn translate_message(
     state: &BotState,
     markdown: &str,
     source: &str,
     target: &str,
 ) -> Option<(String, String)> {
-    translate_html_content(state, &render_html(markdown), source, target).await
+    translate_html_with_fallback(state, &render_html(markdown), markdown, source, target).await
 }
 
 /// Compute the `relates_to` relation for a translation message.
@@ -1158,7 +1183,7 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
     };
 
     let results = join_all(
-        targets.iter().map(|target| translate_html_content(&state, &html_to_translate, &lang, target))
+        targets.iter().map(|target| translate_html_with_fallback(&state, &html_to_translate, text, &lang, target))
     ).await;
     let mut plain_lines = Vec::new();
     let mut html_lines = Vec::new();
