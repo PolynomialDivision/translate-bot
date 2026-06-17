@@ -55,7 +55,7 @@ use matrix_sdk::{
     },
 };
 use serde::{Deserialize, Serialize};
-use tokio::{fs, sync::Mutex, time::sleep};
+use tokio::{fs, sync::{Mutex, Semaphore}, time::sleep};
 use tracing::{error, info, warn};
 
 #[derive(Deserialize)]
@@ -165,6 +165,8 @@ struct BotState {
     // Maps user's original event_id → bot's translation event_id.
     // Used to edit the bot's translation when the user edits their message.
     translation_map: Arc<RwLock<HashMap<OwnedEventId, OwnedEventId>>>,
+    // Caps concurrent in-flight message handlers to bound task/connection growth.
+    inflight: Arc<Semaphore>,
 }
 
 impl BotState {
@@ -175,8 +177,12 @@ impl BotState {
             .json(&DetectRequest { q: text, api_key: self.lt_api_key.as_deref() })
             .send()
             .await
+            .map_err(|e| warn!("ltengine /detect request error: {e}"))
             .ok()?;
-        let results: Vec<DetectResult> = resp.json().await.ok()?;
+        let results: Vec<DetectResult> = resp.json()
+            .await
+            .map_err(|e| warn!("ltengine /detect response parse error: {e}"))
+            .ok()?;
         results
             .into_iter()
             .max_by(|a, b| {
@@ -198,8 +204,12 @@ impl BotState {
             })
             .send()
             .await
+            .map_err(|e| warn!("ltengine /translate request error (src={source} tgt={target}): {e}"))
             .ok()?;
-        let result: TranslateResponse = resp.json().await.ok()?;
+        let result: TranslateResponse = resp.json()
+            .await
+            .map_err(|e| warn!("ltengine /translate response parse error: {e}"))
+            .ok()?;
         Some(result.translated_text)
     }
 }
@@ -269,7 +279,16 @@ async fn main() -> Result<()> {
         allowed_inviters,
         reset_allowed: Arc::new(Mutex::new(HashSet::new())),
         translation_map: Arc::new(RwLock::new(HashMap::new())),
+        inflight: Arc::new(Semaphore::new(8)),
     };
+
+    // Probe ltengine reachability at startup so failures are visible in logs.
+    info!("ltengine URL: {}", state.lt_url);
+    match state.http.get(format!("{}/languages", state.lt_url)).send().await {
+        Ok(resp) if resp.status().is_success() => info!("ltengine reachable at startup"),
+        Ok(resp) => warn!("ltengine returned {} at startup — translations may fail", resp.status()),
+        Err(e) => warn!("ltengine not reachable at startup: {e} — translations will fail until it is up"),
+    }
 
     // Advance the sync token past any backlog from downtime before registering
     // handlers — events that arrived while the bot was down are silently discarded.
@@ -408,7 +427,13 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                tokio::spawn(handle_message(state, room, ev));
+                let inflight = Arc::clone(&state.inflight);
+                tokio::spawn(async move {
+                    // Acquire a slot before starting — bounds concurrent HTTP connections
+                    // to ltengine and prevents unbounded task accumulation when it is slow.
+                    let _permit = inflight.acquire_owned().await;
+                    handle_message(state, room, ev).await;
+                });
             }
         }
     });
@@ -1211,8 +1236,18 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
 
     match room.send(content).await {
         Ok(resp) => {
-            state.translation_map.write().unwrap()
-                .insert(event.event_id.clone(), resp.response.event_id);
+            match state.translation_map.write() {
+                Ok(mut map) => {
+                    map.insert(event.event_id.clone(), resp.response.event_id);
+                    if map.len() > 10_000 {
+                        // Prevent unbounded growth — edit/redact tracking for very old
+                        // messages is sacrificed before memory becomes a problem.
+                        map.retain(|_, _| false);
+                        warn!("translation_map cleared after exceeding 10 000 entries");
+                    }
+                }
+                Err(e) => warn!("translation_map lock poisoned on write: {e}"),
+            }
         }
         Err(e) => error!("Failed to send translation: {e}"),
     }
@@ -1239,9 +1274,13 @@ async fn handle_edit(
     new_content: RoomMessageEventContentWithoutRelation,
 ) {
     // Look up whether we have a translation for this event.
-    let bot_event_id = state.translation_map.read().unwrap()
-        .get(&original_event_id)
-        .cloned();
+    let bot_event_id = match state.translation_map.read() {
+        Ok(map) => map.get(&original_event_id).cloned(),
+        Err(e) => {
+            warn!("translation_map lock poisoned on read in handle_edit: {e}");
+            return;
+        }
+    };
 
     let Some(bot_event_id) = bot_event_id else {
         info!("Edit for unknown event {original_event_id} — no cached translation, ignoring");
@@ -1252,11 +1291,17 @@ async fn handle_edit(
     let MessageType::Text(text_content) = &new_content.msgtype else { return };
     let raw = text_content.body.trim();
 
-    // Strip reply fallback lines (same as normal message handling).
-    let text: String = raw.lines()
-        .filter(|l| !l.starts_with("> "))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Strip the leading reply-fallback block only — same logic as handle_message,
+    // so mid-body intentional blockquotes are preserved.
+    let text: String = if raw.starts_with("> ") {
+        raw.lines()
+            .skip_while(|l| l.starts_with("> "))
+            .skip_while(|l| l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        raw.to_owned()
+    };
     let text = text.trim();
     if text.is_empty() { return; }
 
