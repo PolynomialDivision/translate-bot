@@ -260,7 +260,10 @@ async fn main() -> Result<()> {
         thread_replies: config.translation.thread_replies,
         silent_messages: config.translation.silent_messages,
         startup_time,
-        http: reqwest::Client::new(),
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .expect("failed to build HTTP client"),
         bot_user_id: user_id,
         admin_users,
         allowed_inviters,
