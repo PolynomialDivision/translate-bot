@@ -30,14 +30,10 @@ fn flag_for_lang(lang: &str) -> &'static str {
 }
 
 use anyhow::Result;
-use pulldown_cmark::{Options, Parser};
-use pulldown_cmark::html::push_html;
 use futures_util::future::join_all;
 use matrix_sdk::{
-    Client, Room, RoomState,
     config::SyncSettings,
     ruma::{
-        OwnedEventId, OwnedServerName, OwnedUserId, RoomOrAliasId,
         api::client::filter::FilterDefinition,
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
@@ -52,11 +48,23 @@ use matrix_sdk::{
                 redaction::OriginalSyncRoomRedactionEvent,
             },
         },
+        OwnedEventId, OwnedServerName, OwnedUserId, RoomOrAliasId,
     },
+    Client, Room, RoomState,
 };
+use pulldown_cmark::html::push_html;
+use pulldown_cmark::{Options, Parser};
 use serde::{Deserialize, Serialize};
-use tokio::{fs, sync::{Mutex, Semaphore}, time::sleep};
+use tokio::{
+    fs,
+    sync::{Mutex, Semaphore},
+    time::sleep,
+};
 use tracing::{error, info, warn};
+
+const MAX_TRANSLATION_ABSOLUTE_CHARS: usize = 1_000;
+const MAX_TRANSLATION_EXPANSION_FACTOR: usize = 6;
+const MAX_TRANSLATION_EXPANSION_SLACK: usize = 80;
 
 #[derive(Deserialize)]
 struct Config {
@@ -92,6 +100,9 @@ struct TranslationConfig {
     /// Most Matrix clients render notices with muted styling and suppress push notifications.
     #[serde(default)]
     silent_messages: bool,
+    /// Maximum concurrent requests to the translation backend.
+    #[serde(default = "default_backend_concurrency")]
+    backend_concurrency: usize,
 }
 
 fn default_langs() -> Vec<String> {
@@ -102,7 +113,13 @@ fn default_min_confidence() -> f64 {
     0.5
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
+
+fn default_backend_concurrency() -> usize {
+    4
+}
 
 impl Default for TranslationConfig {
     fn default() -> Self {
@@ -112,6 +129,7 @@ impl Default for TranslationConfig {
             reply_to_original: true,
             thread_replies: true,
             silent_messages: false,
+            backend_concurrency: default_backend_concurrency(),
         }
     }
 }
@@ -167,31 +185,60 @@ struct BotState {
     translation_map: Arc<RwLock<HashMap<OwnedEventId, OwnedEventId>>>,
     // Caps concurrent in-flight message handlers to bound task/connection growth.
     inflight: Arc<Semaphore>,
+    // Caps requests to ltengine across detection and translation.
+    lt_requests: Arc<Semaphore>,
 }
 
 impl BotState {
     async fn detect(&self, text: &str) -> Option<(String, f64)> {
+        let _permit = self
+            .lt_requests
+            .acquire()
+            .await
+            .map_err(|e| warn!("ltengine request limiter closed: {e}"))
+            .ok()?;
         let resp = self
             .http
             .post(format!("{}/detect", self.lt_url))
-            .json(&DetectRequest { q: text, api_key: self.lt_api_key.as_deref() })
+            .json(&DetectRequest {
+                q: text,
+                api_key: self.lt_api_key.as_deref(),
+            })
             .send()
             .await
             .map_err(|e| warn!("ltengine /detect request error: {e}"))
+            .ok()?
+            .error_for_status()
+            .map_err(|e| warn!("ltengine /detect returned error status: {e}"))
             .ok()?;
-        let results: Vec<DetectResult> = resp.json()
+        let results: Vec<DetectResult> = resp
+            .json()
             .await
             .map_err(|e| warn!("ltengine /detect response parse error: {e}"))
             .ok()?;
         results
             .into_iter()
             .max_by(|a, b| {
-                a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal)
+                a.confidence
+                    .partial_cmp(&b.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|r| (r.language, r.confidence))
     }
 
-    async fn translate(&self, text: &str, source: &str, target: &str, format: &str) -> Option<String> {
+    async fn translate(
+        &self,
+        text: &str,
+        source: &str,
+        target: &str,
+        format: &str,
+    ) -> Option<String> {
+        let _permit = self
+            .lt_requests
+            .acquire()
+            .await
+            .map_err(|e| warn!("ltengine request limiter closed: {e}"))
+            .ok()?;
         let resp = self
             .http
             .post(format!("{}/translate", self.lt_url))
@@ -204,9 +251,17 @@ impl BotState {
             })
             .send()
             .await
-            .map_err(|e| warn!("ltengine /translate request error (src={source} tgt={target}): {e}"))
+            .map_err(|e| {
+                warn!("ltengine /translate request error (src={source} tgt={target}): {e}")
+            })
+            .ok()?
+            .error_for_status()
+            .map_err(|e| {
+                warn!("ltengine /translate returned error status (src={source} tgt={target}): {e}")
+            })
             .ok()?;
-        let result: TranslateResponse = resp.json()
+        let result: TranslateResponse = resp
+            .json()
             .await
             .map_err(|e| warn!("ltengine /translate response parse error: {e}"))
             .ok()?;
@@ -218,20 +273,22 @@ impl BotState {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".to_owned());
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "config.toml".to_owned());
     let config_str = fs::read_to_string(&config_path)
         .await
         .unwrap_or_else(|_| std::fs::read_to_string("config.toml").expect("config.toml not found"));
     let config: Config = toml::from_str(&config_str)?;
 
-    let store_path = PathBuf::from(
-        std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()),
-    );
+    let store_path =
+        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
     let (client, user_id) = mxbot_common::session::build_and_restore(
         &config.matrix,
         &store_path,
         config.security.encryption_strategy.into(),
-    ).await?;
+    )
+    .await?;
 
     let admin_users: HashSet<OwnedUserId> = config
         .security
@@ -260,6 +317,7 @@ async fn main() -> Result<()> {
     }
 
     let startup_time = SystemTime::now();
+    let backend_concurrency = config.translation.backend_concurrency.max(1);
 
     let state = BotState {
         lt_url: config.libretranslate.url.trim_end_matches('/').to_owned(),
@@ -280,14 +338,25 @@ async fn main() -> Result<()> {
         reset_allowed: Arc::new(Mutex::new(HashSet::new())),
         translation_map: Arc::new(RwLock::new(HashMap::new())),
         inflight: Arc::new(Semaphore::new(8)),
+        lt_requests: Arc::new(Semaphore::new(backend_concurrency)),
     };
 
     // Probe ltengine reachability at startup so failures are visible in logs.
     info!("ltengine URL: {}", state.lt_url);
-    match state.http.get(format!("{}/languages", state.lt_url)).send().await {
+    match state
+        .http
+        .get(format!("{}/languages", state.lt_url))
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => info!("ltengine reachable at startup"),
-        Ok(resp) => warn!("ltengine returned {} at startup — translations may fail", resp.status()),
-        Err(e) => warn!("ltengine not reachable at startup: {e} — translations will fail until it is up"),
+        Ok(resp) => warn!(
+            "ltengine returned {} at startup — translations may fail",
+            resp.status()
+        ),
+        Err(e) => {
+            warn!("ltengine not reachable at startup: {e} — translations will fail until it is up")
+        }
     }
 
     // Advance the sync token past any backlog from downtime before registering
@@ -302,7 +371,10 @@ async fn main() -> Result<()> {
     // invites, not ones already persisted in the SQLite store).
     let invited = client.invited_rooms();
     if !invited.is_empty() {
-        info!("Pending invite(s) found after initial sync — joining {} room(s)", invited.len());
+        info!(
+            "Pending invite(s) found after initial sync — joining {} room(s)",
+            invited.len()
+        );
         for room in invited {
             let room_id = room.room_id().to_owned();
             let via: Vec<OwnedServerName> = room_id
@@ -394,7 +466,9 @@ async fn main() -> Result<()> {
                     return;
                 };
                 tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client, Arc::clone(&state.reset_allowed), request,
+                    client,
+                    Arc::clone(&state.reset_allowed),
+                    request,
                 ));
             }
         }
@@ -406,7 +480,11 @@ async fn main() -> Result<()> {
         move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
             let state = state.clone();
             async move {
-                info!("Received room message from {} in {}", ev.sender, room.room_id());
+                info!(
+                    "Received room message from {} in {}",
+                    ev.sender,
+                    room.room_id()
+                );
 
                 if let MessageType::VerificationRequest(_) = &ev.content.msgtype {
                     let Some(request) = client
@@ -418,8 +496,10 @@ async fn main() -> Result<()> {
                         return;
                     };
                     tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client, Arc::clone(&state.reset_allowed), request,
-                ));
+                        client,
+                        Arc::clone(&state.reset_allowed),
+                        request,
+                    ));
                     return;
                 }
 
@@ -457,13 +537,15 @@ async fn main() -> Result<()> {
                 // Check whether we have a translation for this event.
                 let bot_event_id = match state.translation_map.read() {
                     Ok(map) => map.get(&redacted_id).cloned(),
-                    Err(e)  => {
+                    Err(e) => {
                         warn!("translation_map lock poisoned on redaction read: {e}");
                         return;
                     }
                 };
 
-                let Some(bot_event_id) = bot_event_id else { return };
+                let Some(bot_event_id) = bot_event_id else {
+                    return;
+                };
 
                 info!(
                     "Original message {redacted_id} was redacted — \
@@ -477,15 +559,20 @@ async fn main() -> Result<()> {
 
                 // Remove from map so we don't attempt a double-redact.
                 match state.translation_map.write() {
-                    Ok(mut map) => { map.remove(&redacted_id); }
-                    Err(e)      => warn!("translation_map lock poisoned on redaction write: {e}"),
+                    Ok(mut map) => {
+                        map.remove(&redacted_id);
+                    }
+                    Err(e) => warn!("translation_map lock poisoned on redaction write: {e}"),
                 }
             }
         }
     });
 
     loop {
-        match client.sync(SyncSettings::default().filter(filter.clone().into())).await {
+        match client
+            .sync(SyncSettings::default().filter(filter.clone().into()))
+            .await
+        {
             Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
             Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
         }
@@ -555,6 +642,64 @@ mod tests {
     fn html_to_plain_decodes_entities() {
         let plain = html_to_plain(&render_html("a & b < c > d"));
         assert_eq!(plain, "a & b < c > d");
+    }
+
+    #[test]
+    fn rejects_verbose_reasoning_translation() {
+        let translated = r#"4. **Step 1: Identify the source language and target language.**
+* Source: English
+* Target: German
+5. **Step 2: Analyze the source text.**
+* Text: `hallo`
+6. **Step 3: Translate the content.**
+* "hallo" in English is "hallo" in German.
+7. **Step 4: Re-insert HTML tags.**
+8. **Step 5: Final Review.**"#;
+
+        assert_eq!(
+            translation_rejection_reason("hallo", translated),
+            Some("translation expanded far beyond source length")
+        );
+    }
+
+    #[test]
+    fn rejects_repeated_phrase_loop() {
+        let translated =
+            "name more chat more chat more chat more chat more chat more chat more chat";
+
+        assert_eq!(
+            translation_rejection_reason("mehfrach chat", translated),
+            Some("translation contains repeated phrase loop")
+        );
+    }
+
+    #[test]
+    fn accepts_reasonable_short_translation() {
+        assert_eq!(translation_rejection_reason("hallo", "привіт"), None);
+    }
+
+    #[test]
+    fn accepts_normal_text_with_reasoning_words() {
+        let source = "Step 1: choose the source language and target language.";
+        let translated = "Schritt 1: Waehlen Sie die Ausgangssprache und die Zielsprache.";
+
+        assert_eq!(translation_rejection_reason(source, translated), None);
+    }
+
+    #[test]
+    fn rejects_backend_introduced_model_control_token() {
+        assert_eq!(
+            translation_rejection_reason("Hoffausgang Garten.", "<|channel>Вихід у сад."),
+            Some("translation contains backend control token")
+        );
+    }
+
+    #[test]
+    fn accepts_model_control_token_when_it_was_in_source() {
+        assert_eq!(
+            translation_rejection_reason("literal <|channel> token", "literales <|channel> Token"),
+            None
+        );
     }
 
     // ── strip_mx_reply tests ──────────────────────────────────────────────────
@@ -662,20 +807,28 @@ mod tests {
     #[test]
     fn relation_standalone_when_reply_to_original_false_thread_true() {
         let id = eid("$ev2:example.org");
-        assert!(make_relation(&id, &id, false, true, false).is_none(),
-            "thread_replies=true must not override reply_to_original=false");
+        assert!(
+            make_relation(&id, &id, false, true, false).is_none(),
+            "thread_replies=true must not override reply_to_original=false"
+        );
     }
 
     #[test]
     fn relation_reply_when_reply_true_thread_false_not_in_thread() {
         let id = eid("$ev3:example.org");
-        assert!(matches!(make_relation(&id, &id, true, false, false), Some(Relation::Reply(_))));
+        assert!(matches!(
+            make_relation(&id, &id, true, false, false),
+            Some(Relation::Reply(_))
+        ));
     }
 
     #[test]
     fn relation_thread_when_reply_true_thread_true() {
         let id = eid("$ev4:example.org");
-        assert!(matches!(make_relation(&id, &id, true, true, false), Some(Relation::Thread(_))));
+        assert!(matches!(
+            make_relation(&id, &id, true, true, false),
+            Some(Relation::Thread(_))
+        ));
     }
 
     #[test]
@@ -684,8 +837,9 @@ mod tests {
         // an existing thread.  If the original message is already in a thread,
         // the translation must always be a thread reply into that same thread.
         let event_id = eid("$reply_in_thread:example.org");
-        let root_id  = eid("$root:example.org");
-        let Some(Relation::Thread(t)) = make_relation(&event_id, &root_id, true, false, true) else {
+        let root_id = eid("$root:example.org");
+        let Some(Relation::Thread(t)) = make_relation(&event_id, &root_id, true, false, true)
+        else {
             panic!("expected Thread when in_thread=true regardless of thread_replies");
         };
         assert_eq!(t.event_id, root_id);
@@ -703,12 +857,13 @@ mod tests {
 
     #[test]
     fn relation_thread_uses_thread_root() {
-        let event_id   = eid("$reply:example.org");
-        let root_id    = eid("$root:example.org");
-        let Some(Relation::Thread(t)) = make_relation(&event_id, &root_id, true, true, false) else {
+        let event_id = eid("$reply:example.org");
+        let root_id = eid("$root:example.org");
+        let Some(Relation::Thread(t)) = make_relation(&event_id, &root_id, true, true, false)
+        else {
             panic!("expected Thread");
         };
-        assert_eq!(t.event_id, root_id,  "thread root must be root_id");
+        assert_eq!(t.event_id, root_id, "thread root must be root_id");
         // in_reply_to inside the thread must point to the translated event itself
         assert_eq!(t.in_reply_to.as_ref().map(|r| &r.event_id), Some(&event_id));
     }
@@ -716,9 +871,19 @@ mod tests {
     #[test]
     fn default_translation_config() {
         let cfg = TranslationConfig::default();
-        assert!(cfg.reply_to_original, "default: reply_to_original must be true");
-        assert!(cfg.thread_replies,    "default: thread_replies must be true");
-        assert!(!cfg.silent_messages,  "default: silent_messages must be false");
+        assert!(
+            cfg.reply_to_original,
+            "default: reply_to_original must be true"
+        );
+        assert!(cfg.thread_replies, "default: thread_replies must be true");
+        assert!(
+            !cfg.silent_messages,
+            "default: silent_messages must be false"
+        );
+        assert_eq!(
+            cfg.backend_concurrency, 4,
+            "default: backend_concurrency must be 4"
+        );
     }
 
     // ── Serde / default-value proof ───────────────────────────────────────────
@@ -753,8 +918,10 @@ reply_to_original = true"#;
         // Key is absent — serde invokes the #[serde(default = "default_true")] path.
         let toml = r#"langs = ["en", "de"]"#;
         let cfg: TranslationConfig = toml::from_str(toml).unwrap();
-        assert!(cfg.reply_to_original,
-            "absent key must default to true via default_true()");
+        assert!(
+            cfg.reply_to_original,
+            "absent key must default to true via default_true()"
+        );
     }
 
     #[test]
@@ -763,8 +930,10 @@ reply_to_original = true"#;
         // Config has #[serde(default)] on the translation field, which calls
         // TranslationConfig::default() → reply_to_original = true.
         let cfg = TranslationConfig::default();
-        assert!(cfg.reply_to_original,
-            "TranslationConfig::default() must set reply_to_original = true");
+        assert!(
+            cfg.reply_to_original,
+            "TranslationConfig::default() must set reply_to_original = true"
+        );
     }
 
     // ── Exact serialized Matrix event JSON ────────────────────────────────────
@@ -774,10 +943,16 @@ reply_to_original = true"#;
     // to other clients.  This is the ground truth for client compatibility.
 
     fn content_with_relation(reply_to_original: bool, thread_replies: bool) -> serde_json::Value {
-        let event_id  = eid("$original:example.org");
+        let event_id = eid("$original:example.org");
         let thread_root = eid("$root:example.org");
         let mut content = make_translation_content("🇬🇧 Hello".into(), "🇬🇧 Hello".into(), false);
-        content.relates_to = make_relation(&event_id, &thread_root, reply_to_original, thread_replies, false);
+        content.relates_to = make_relation(
+            &event_id,
+            &thread_root,
+            reply_to_original,
+            thread_replies,
+            false,
+        );
         serde_json::to_value(&content).unwrap()
     }
 
@@ -787,8 +962,10 @@ reply_to_original = true"#;
         // Expected JSON:
         //   { "msgtype": "m.text", "body": "...", "format": "...", "formatted_body": "..." }
         let json = content_with_relation(false, false);
-        assert!(json.get("m.relates_to").is_none(),
-            "standalone must have no m.relates_to field; got: {json}");
+        assert!(
+            json.get("m.relates_to").is_none(),
+            "standalone must have no m.relates_to field; got: {json}"
+        );
     }
 
     #[test]
@@ -800,12 +977,16 @@ reply_to_original = true"#;
         //   }
         // Note: no "rel_type" key — pure replies do not have rel_type per Matrix spec.
         let json = content_with_relation(true, false);
-        let rel  = &json["m.relates_to"];
+        let rel = &json["m.relates_to"];
         assert!(!rel.is_null(), "m.relates_to must be present");
-        assert!(rel.get("rel_type").is_none(),
-            "plain reply must not have rel_type; got: {rel}");
-        assert_eq!(rel["m.in_reply_to"]["event_id"], "$original:example.org",
-            "in_reply_to must point to $original:example.org");
+        assert!(
+            rel.get("rel_type").is_none(),
+            "plain reply must not have rel_type; got: {rel}"
+        );
+        assert_eq!(
+            rel["m.in_reply_to"]["event_id"], "$original:example.org",
+            "in_reply_to must point to $original:example.org"
+        );
     }
 
     #[test]
@@ -823,14 +1004,21 @@ reply_to_original = true"#;
         // an absent is_falling_back is equivalent to false — a genuine thread
         // reply.  is_falling_back only appears in the JSON when true (fallback).
         let json = content_with_relation(true, true);
-        let rel  = &json["m.relates_to"];
-        assert_eq!(rel["rel_type"],  "m.thread",             "rel_type must be m.thread");
-        assert_eq!(rel["event_id"],  "$root:example.org",    "event_id must be thread root");
-        assert_eq!(rel["m.in_reply_to"]["event_id"], "$original:example.org",
-            "in_reply_to inside thread must point to translated event");
-        assert!(rel.get("is_falling_back").is_none(),
+        let rel = &json["m.relates_to"];
+        assert_eq!(rel["rel_type"], "m.thread", "rel_type must be m.thread");
+        assert_eq!(
+            rel["event_id"], "$root:example.org",
+            "event_id must be thread root"
+        );
+        assert_eq!(
+            rel["m.in_reply_to"]["event_id"], "$original:example.org",
+            "in_reply_to inside thread must point to translated event"
+        );
+        assert!(
+            rel.get("is_falling_back").is_none(),
             "is_falling_back=false is omitted by ruma (absent == false per Matrix spec); \
-             if it appears it means ruma set it to true unexpectedly: {rel}");
+             if it appears it means ruma set it to true unexpectedly: {rel}"
+        );
     }
 
     // ── Image caption path integration ───────────────────────────────────────
@@ -863,10 +1051,14 @@ reply_to_original = true"#;
         content.relates_to = make_relation(&caption_event_id, &thread_root, true, false, false);
 
         let json = serde_json::to_value(&content).unwrap();
-        assert!(json["m.relates_to"].get("rel_type").is_none(),
-            "caption reply must not have rel_type");
-        assert_eq!(json["m.relates_to"]["m.in_reply_to"]["event_id"],
-            "$caption:example.org");
+        assert!(
+            json["m.relates_to"].get("rel_type").is_none(),
+            "caption reply must not have rel_type"
+        );
+        assert_eq!(
+            json["m.relates_to"]["m.in_reply_to"]["event_id"],
+            "$caption:example.org"
+        );
     }
 
     // Case B: caption event is already inside a thread.
@@ -875,7 +1067,7 @@ reply_to_original = true"#;
 
     #[test]
     fn image_caption_threaded_event_thread_relation() {
-        let thread_root_id   = eid("$thread_root:example.org");
+        let thread_root_id = eid("$thread_root:example.org");
         let caption_event_id = eid("$caption_in_thread:example.org");
         // resolve_thread_root would return thread_root_id in this case
         let thread_root = thread_root_id.clone();
@@ -885,10 +1077,12 @@ reply_to_original = true"#;
         content.relates_to = make_relation(&caption_event_id, &thread_root, true, false, true);
 
         let json = serde_json::to_value(&content).unwrap();
-        assert_eq!(json["m.relates_to"]["rel_type"],  "m.thread");
-        assert_eq!(json["m.relates_to"]["event_id"],  "$thread_root:example.org");
-        assert_eq!(json["m.relates_to"]["m.in_reply_to"]["event_id"],
-            "$caption_in_thread:example.org");
+        assert_eq!(json["m.relates_to"]["rel_type"], "m.thread");
+        assert_eq!(json["m.relates_to"]["event_id"], "$thread_root:example.org");
+        assert_eq!(
+            json["m.relates_to"]["m.in_reply_to"]["event_id"],
+            "$caption_in_thread:example.org"
+        );
     }
 
     #[test]
@@ -900,11 +1094,12 @@ reply_to_original = true"#;
         content.relates_to = make_relation(&caption_event_id, &thread_root, false, false, false);
 
         let json = serde_json::to_value(&content).unwrap();
-        assert!(json.get("m.relates_to").is_none(),
-            "caption with reply_to_original=false must produce no relation");
+        assert!(
+            json.get("m.relates_to").is_none(),
+            "caption with reply_to_original=false must produce no relation"
+        );
     }
 }
-
 
 /// Parse `markdown` and return the indices + full text of every `Event::Text`
 /// node that sits outside a code block.  These are the nodes that should be
@@ -960,12 +1155,92 @@ fn html_to_plain(html: &str) -> String {
         .replace("&#39;", "'")
 }
 
+fn translation_rejection_reason(
+    source_plain: &str,
+    translated_plain: &str,
+) -> Option<&'static str> {
+    let source_chars = source_plain.chars().count().max(1);
+    let translated_chars = translated_plain.chars().count();
+    let max_relative = source_chars
+        .saturating_mul(MAX_TRANSLATION_EXPANSION_FACTOR)
+        .saturating_add(MAX_TRANSLATION_EXPANSION_SLACK);
+    let max_allowed = max_relative.min(MAX_TRANSLATION_ABSOLUTE_CHARS);
+
+    if translated_chars > max_allowed {
+        return Some("translation expanded far beyond source length");
+    }
+
+    if contains_introduced_model_control_token(source_plain, translated_plain) {
+        return Some("translation contains backend control token");
+    }
+
+    let lower = translated_plain.to_lowercase();
+    if has_repeated_ngram_loop(&lower, 2, 4) || has_repeated_ngram_loop(&lower, 3, 3) {
+        return Some("translation contains repeated phrase loop");
+    }
+
+    None
+}
+
+fn contains_introduced_model_control_token(source: &str, translated: &str) -> bool {
+    let mut rest = translated;
+    while let Some(start) = rest.find("<|") {
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find('>') else {
+            break;
+        };
+        let token = &rest[start..start + 2 + end + 1];
+        let body = &after_start[..end];
+        let valid_control_shape = !body.is_empty()
+            && body
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '|'));
+        if valid_control_shape && !source.contains(token) {
+            return true;
+        }
+        rest = &after_start[end + 1..];
+    }
+
+    false
+}
+
+fn has_repeated_ngram_loop(text: &str, ngram_len: usize, min_repeats: usize) -> bool {
+    let words: Vec<&str> = text
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .collect();
+
+    if words.len() < ngram_len * min_repeats {
+        return false;
+    }
+
+    for start in 0..=words.len() - (ngram_len * min_repeats) {
+        let ngram = &words[start..start + ngram_len];
+        let mut repeats = 1;
+        while start + ((repeats + 1) * ngram_len) <= words.len() {
+            let next_start = start + repeats * ngram_len;
+            if words[next_start..next_start + ngram_len] != *ngram {
+                break;
+            }
+            repeats += 1;
+            if repeats >= min_repeats {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Strip the `<mx-reply>…</mx-reply>` fallback block that Matrix clients prepend
 /// to `formatted_body` when a message is a reply.  Returns the remaining HTML.
 fn strip_mx_reply(html: &str) -> String {
     if let Some(start) = html.find("<mx-reply>") {
         if let Some(rel_end) = html[start..].find("</mx-reply>") {
-            return html[start + rel_end + "</mx-reply>".len()..].trim_start().to_owned();
+            return html[start + rel_end + "</mx-reply>".len()..]
+                .trim_start()
+                .to_owned();
         }
     }
     html.to_owned()
@@ -981,9 +1256,14 @@ async fn translate_html_content(
 ) -> Option<(String, String)> {
     match state.translate(html, source, target, "html").await {
         Some(translated_html) => {
+            let source_plain = html_to_plain(html);
             let plain = html_to_plain(&translated_html);
             if plain.is_empty() {
                 warn!("Translation to {target} produced empty text — skipping");
+                return None;
+            }
+            if let Some(reason) = translation_rejection_reason(&source_plain, &plain) {
+                warn!("Translation to {target} rejected: {reason}");
                 return None;
             }
             Some((plain, inline_html(&translated_html)))
@@ -1013,17 +1293,29 @@ async fn translate_html_with_fallback(
     if translated.is_empty() {
         return None;
     }
+    if let Some(reason) = translation_rejection_reason(plain, &translated) {
+        warn!("Plain-text translation to {target} rejected: {reason}");
+        return None;
+    }
     Some((translated.clone(), translated))
 }
 
-/// Convenience wrapper: render Markdown to HTML then translate, with plain-text fallback.
-async fn translate_message(
+async fn translate_text_content(
     state: &BotState,
-    markdown: &str,
+    plain: &str,
     source: &str,
     target: &str,
 ) -> Option<(String, String)> {
-    translate_html_with_fallback(state, &render_html(markdown), markdown, source, target).await
+    let translated = state.translate(plain, source, target, "text").await?;
+    let translated = translated.trim().to_owned();
+    if translated.is_empty() {
+        return None;
+    }
+    if let Some(reason) = translation_rejection_reason(plain, &translated) {
+        warn!("Text translation to {target} rejected: {reason}");
+        return None;
+    }
+    Some((translated.clone(), translated))
 }
 
 /// Compute the `relates_to` relation for a translation message.
@@ -1053,9 +1345,14 @@ fn make_relation(
         return None;
     }
     if in_thread || thread_replies {
-        Some(Relation::Thread(Thread::reply(thread_root.clone(), event_id.clone())))
+        Some(Relation::Thread(Thread::reply(
+            thread_root.clone(),
+            event_id.clone(),
+        )))
     } else {
-        Some(Relation::Reply(Reply::new(InReplyTo::new(event_id.clone()))))
+        Some(Relation::Reply(Reply::new(InReplyTo::new(
+            event_id.clone(),
+        ))))
     }
 }
 
@@ -1077,22 +1374,34 @@ async fn handle_image_caption(
     caption: String,
 ) {
     let Some((lang, confidence)) = state.detect(&caption).await else {
-        warn!("Language detection failed for image caption ({})", event.sender);
+        warn!(
+            "Language detection failed for image caption ({})",
+            event.sender
+        );
         return;
     };
 
-    info!("image caption lang={lang} conf={confidence:.2} sender={} room={}", event.sender, room.room_id());
+    info!(
+        "image caption lang={lang} conf={confidence:.2} sender={} room={}",
+        event.sender,
+        room.room_id()
+    );
 
     if confidence < state.min_confidence || !state.langs.contains(&lang) {
         return;
     }
 
     let targets: Vec<&String> = state.langs.iter().filter(|t| t.as_str() != lang).collect();
-    if targets.is_empty() { return; }
+    if targets.is_empty() {
+        return;
+    }
 
     let results = join_all(
-        targets.iter().map(|target| translate_message(&state, &caption, &lang, target))
-    ).await;
+        targets
+            .iter()
+            .map(|target| translate_text_content(&state, &caption, &lang, target)),
+    )
+    .await;
     let mut plain_lines = Vec::new();
     let mut html_lines = Vec::new();
     for (target, result) in targets.iter().zip(results) {
@@ -1103,13 +1412,22 @@ async fn handle_image_caption(
         }
     }
 
-    if plain_lines.is_empty() { return; }
+    if plain_lines.is_empty() {
+        return;
+    }
 
     let plain_body = plain_lines.join("\n");
-    let mut content = make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
+    let mut content =
+        make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
     let in_thread = matches!(&event.content.relates_to, Some(Relation::Thread(_)));
     let thread_root = resolve_thread_root(&event);
-    content.relates_to = make_relation(&event.event_id, &thread_root, state.reply_to_original, state.thread_replies, in_thread);
+    content.relates_to = make_relation(
+        &event.event_id,
+        &thread_root,
+        state.reply_to_original,
+        state.thread_replies,
+        in_thread,
+    );
 
     if let Err(e) = room.send(content).await {
         error!("Failed to send image caption translation: {e}");
@@ -1122,7 +1440,10 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
     // which prevents backlog events from reaching this function at all.
     if let Some(event_time) = event.origin_server_ts.to_system_time() {
         if event_time < state.startup_time {
-            info!("Skipping backlog message {} from {} (pre-startup)", event.event_id, event.sender);
+            info!(
+                "Skipping backlog message {} from {} (pre-startup)",
+                event.event_id, event.sender
+            );
             return;
         }
     }
@@ -1139,7 +1460,8 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
 
     // Handle image messages — translate caption if present.
     if let MessageType::Image(img) = &event.content.msgtype {
-        let caption = img.caption()
+        let caption = img
+            .caption()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
@@ -1150,7 +1472,9 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         return;
     }
 
-    let MessageType::Text(text_content) = &event.content.msgtype else { return };
+    let MessageType::Text(text_content) = &event.content.msgtype else {
+        return;
+    };
 
     let raw = text_content.body.trim();
 
@@ -1160,7 +1484,10 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
             match target.trim().parse::<OwnedUserId>() {
                 Ok(target_user) => {
                     state.reset_allowed.lock().await.insert(target_user.clone());
-                    info!("Trust reset allowed for {} (by {})", target_user, event.sender);
+                    info!(
+                        "Trust reset allowed for {} (by {})",
+                        target_user, event.sender
+                    );
                 }
                 Err(_) => warn!("!reset-trust: invalid user ID '{}'", target.trim()),
             }
@@ -1192,7 +1519,11 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         return;
     };
 
-    info!("lang={lang} conf={confidence:.2} sender={} room={}", event.sender, room.room_id());
+    info!(
+        "lang={lang} conf={confidence:.2} sender={} room={}",
+        event.sender,
+        room.room_id()
+    );
 
     if confidence < state.min_confidence || !state.langs.contains(&lang) {
         return;
@@ -1203,16 +1534,23 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         return;
     }
 
-    // Prefer formatted_body (already HTML — strip <mx-reply> wrapper for replies).
-    // Fall back to rendering the plain body as Markdown.
-    let html_to_translate = match &text_content.formatted {
-        Some(fb) if fb.format == MessageFormat::Html => strip_mx_reply(&fb.body),
-        _ => render_html(text),
+    let results = match &text_content.formatted {
+        Some(fb) if fb.format == MessageFormat::Html => {
+            let html_to_translate = strip_mx_reply(&fb.body);
+            join_all(targets.iter().map(|target| {
+                translate_html_with_fallback(&state, &html_to_translate, text, &lang, target)
+            }))
+            .await
+        }
+        _ => {
+            join_all(
+                targets
+                    .iter()
+                    .map(|target| translate_text_content(&state, text, &lang, target)),
+            )
+            .await
+        }
     };
-
-    let results = join_all(
-        targets.iter().map(|target| translate_html_with_fallback(&state, &html_to_translate, text, &lang, target))
-    ).await;
     let mut plain_lines = Vec::new();
     let mut html_lines = Vec::new();
     for (target, result) in targets.iter().zip(results) {
@@ -1223,16 +1561,25 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         }
     }
 
-    if plain_lines.is_empty() { return; }
+    if plain_lines.is_empty() {
+        return;
+    }
 
     let plain_body = plain_lines.join("\n");
-    let mut content = make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
+    let mut content =
+        make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
     let in_thread = matches!(&event.content.relates_to, Some(Relation::Thread(_)));
     let thread_root = resolve_thread_root(&event);
     if state.reply_to_original && (state.thread_replies || in_thread) {
         info!("thread_root={} for event={}", thread_root, event.event_id);
     }
-    content.relates_to = make_relation(&event.event_id, &thread_root, state.reply_to_original, state.thread_replies, in_thread);
+    content.relates_to = make_relation(
+        &event.event_id,
+        &thread_root,
+        state.reply_to_original,
+        state.thread_replies,
+        in_thread,
+    );
 
     match room.send(content).await {
         Ok(resp) => {
@@ -1288,7 +1635,9 @@ async fn handle_edit(
     };
 
     // Use ONLY m.new_content as the source of truth (full replacement, not a diff).
-    let MessageType::Text(text_content) = &new_content.msgtype else { return };
+    let MessageType::Text(text_content) = &new_content.msgtype else {
+        return;
+    };
     let raw = text_content.body.trim();
 
     // Strip the leading reply-fallback block only — same logic as handle_message,
@@ -1303,28 +1652,36 @@ async fn handle_edit(
         raw.to_owned()
     };
     let text = text.trim();
-    if text.is_empty() { return; }
+    if text.is_empty() {
+        return;
+    }
 
     let Some((lang, confidence)) = state.detect(text).await else {
         warn!("Language detection failed for edit of {original_event_id}");
         return;
     };
 
-    if confidence < state.min_confidence || !state.langs.contains(&lang) { return; }
+    if confidence < state.min_confidence || !state.langs.contains(&lang) {
+        return;
+    }
 
     let targets: Vec<&String> = state.langs.iter().filter(|t| t.as_str() != lang).collect();
-    if targets.is_empty() { return; }
+    if targets.is_empty() {
+        return;
+    }
 
     let mut plain_lines = Vec::new();
     let mut html_lines = Vec::new();
     for target in &targets {
-        if let Some((plain, html)) = translate_message(&state, text, &lang, target).await {
+        if let Some((plain, html)) = translate_text_content(&state, text, &lang, target).await {
             let flag = flag_for_lang(target);
             plain_lines.push(format!("{flag} {plain}"));
             html_lines.push(format!("{flag} {html}"));
         }
     }
-    if plain_lines.is_empty() { return; }
+    if plain_lines.is_empty() {
+        return;
+    }
 
     let new_body = plain_lines.join("\n");
     let new_html = html_lines.join("<br>\n");
@@ -1333,12 +1690,19 @@ async fn handle_edit(
     // The thread membership is inherited from bot_event_id — no thread relation needed here.
     // Preserve the same msgtype (m.notice vs m.text) as the original translation.
     let inner_msgtype = if state.silent_messages {
-        MessageType::Notice(NoticeMessageEventContent::html(new_body.clone(), new_html.clone()))
+        MessageType::Notice(NoticeMessageEventContent::html(
+            new_body.clone(),
+            new_html.clone(),
+        ))
     } else {
-        MessageType::Text(TextMessageEventContent::html(new_body.clone(), new_html.clone()))
+        MessageType::Text(TextMessageEventContent::html(
+            new_body.clone(),
+            new_html.clone(),
+        ))
     };
     let new_without = RoomMessageEventContentWithoutRelation::new(inner_msgtype);
-    let mut edit_content = make_translation_content(format!("* {new_body}"), new_html, state.silent_messages);
+    let mut edit_content =
+        make_translation_content(format!("* {new_body}"), new_html, state.silent_messages);
     edit_content.relates_to = Some(Relation::Replacement(Replacement::new(
         bot_event_id.clone(),
         new_without,
@@ -1349,4 +1713,3 @@ async fn handle_edit(
         error!("Failed to send translation edit: {e}");
     }
 }
-

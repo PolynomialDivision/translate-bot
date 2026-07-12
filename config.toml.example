@@ -40,6 +40,9 @@ min_confidence = 0.5
 # trigger push notifications, making them less intrusive for room members who
 # are not the intended audience of the translation.
 # silent_messages = false
+# Maximum concurrent requests to LibreTranslate/ltengine across detection and
+# translation. Lower this if the backend degrades under bursts.
+# backend_concurrency = 4
 
 [security]
 # Users allowed to issue !reset-trust @user:server commands.
