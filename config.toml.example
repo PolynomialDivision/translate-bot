@@ -44,6 +44,16 @@ min_confidence = 0.5
 # translation. Lower this if the backend degrades under bursts.
 # backend_concurrency = 4
 
+# Optional per-room translation overrides. Keys are Matrix room IDs.
+# Any omitted field inherits from [translation].
+# [room_translations."!abcdef:matrix.org"]
+# langs = ["en", "de"]
+# min_confidence = 0.7
+#
+# [room_translations."!ghijkl:matrix.org"]
+# langs = ["de", "uk"]
+# silent_messages = true
+
 [security]
 # Users allowed to issue !reset-trust @user:server commands.
 # Only these users can allow someone to re-verify after their first verification.

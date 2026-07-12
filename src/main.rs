@@ -73,6 +73,8 @@ struct Config {
     #[serde(default)]
     translation: TranslationConfig,
     #[serde(default)]
+    room_translations: HashMap<String, RoomTranslationConfig>,
+    #[serde(default)]
     security: SecurityConfig,
 }
 
@@ -82,7 +84,7 @@ struct LibreTranslateConfig {
     api_key: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct TranslationConfig {
     #[serde(default = "default_langs")]
     langs: Vec<String>,
@@ -103,6 +105,24 @@ struct TranslationConfig {
     /// Maximum concurrent requests to the translation backend.
     #[serde(default = "default_backend_concurrency")]
     backend_concurrency: usize,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct RoomTranslationConfig {
+    langs: Option<Vec<String>>,
+    min_confidence: Option<f64>,
+    reply_to_original: Option<bool>,
+    thread_replies: Option<bool>,
+    silent_messages: Option<bool>,
+}
+
+#[derive(Clone)]
+struct EffectiveTranslationConfig {
+    langs: Vec<String>,
+    min_confidence: f64,
+    reply_to_original: bool,
+    thread_replies: bool,
+    silent_messages: bool,
 }
 
 fn default_langs() -> Vec<String> {
@@ -131,6 +151,31 @@ impl Default for TranslationConfig {
             silent_messages: false,
             backend_concurrency: default_backend_concurrency(),
         }
+    }
+}
+
+fn effective_translation_config(
+    default: &TranslationConfig,
+    room_translations: &HashMap<String, RoomTranslationConfig>,
+    room_id: &str,
+) -> EffectiveTranslationConfig {
+    let room = room_translations.get(room_id);
+    EffectiveTranslationConfig {
+        langs: room
+            .and_then(|cfg| cfg.langs.clone())
+            .unwrap_or_else(|| default.langs.clone()),
+        min_confidence: room
+            .and_then(|cfg| cfg.min_confidence)
+            .unwrap_or(default.min_confidence),
+        reply_to_original: room
+            .and_then(|cfg| cfg.reply_to_original)
+            .unwrap_or(default.reply_to_original),
+        thread_replies: room
+            .and_then(|cfg| cfg.thread_replies)
+            .unwrap_or(default.thread_replies),
+        silent_messages: room
+            .and_then(|cfg| cfg.silent_messages)
+            .unwrap_or(default.silent_messages),
     }
 }
 
@@ -167,11 +212,8 @@ struct TranslateResponse {
 struct BotState {
     lt_url: String,
     lt_api_key: Option<String>,
-    langs: Vec<String>,
-    min_confidence: f64,
-    reply_to_original: bool,
-    thread_replies: bool,
-    silent_messages: bool,
+    translation: TranslationConfig,
+    room_translations: HashMap<String, RoomTranslationConfig>,
     http: reqwest::Client,
     bot_user_id: OwnedUserId,
     admin_users: HashSet<OwnedUserId>,
@@ -190,6 +232,10 @@ struct BotState {
 }
 
 impl BotState {
+    fn translation_for_room(&self, room_id: &str) -> EffectiveTranslationConfig {
+        effective_translation_config(&self.translation, &self.room_translations, room_id)
+    }
+
     async fn detect(&self, text: &str) -> Option<(String, f64)> {
         let _permit = self
             .lt_requests
@@ -322,11 +368,8 @@ async fn main() -> Result<()> {
     let state = BotState {
         lt_url: config.libretranslate.url.trim_end_matches('/').to_owned(),
         lt_api_key: config.libretranslate.api_key,
-        langs: config.translation.langs,
-        min_confidence: config.translation.min_confidence,
-        reply_to_original: config.translation.reply_to_original,
-        thread_replies: config.translation.thread_replies,
-        silent_messages: config.translation.silent_messages,
+        translation: config.translation,
+        room_translations: config.room_translations,
         startup_time,
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
@@ -886,6 +929,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn room_translation_override_changes_only_langs() {
+        let mut rooms = HashMap::new();
+        rooms.insert(
+            "!room:example.org".to_owned(),
+            RoomTranslationConfig {
+                langs: Some(vec!["de".to_owned(), "uk".to_owned()]),
+                ..Default::default()
+            },
+        );
+
+        let default = TranslationConfig {
+            langs: vec!["en".to_owned(), "de".to_owned(), "uk".to_owned()],
+            min_confidence: 0.8,
+            reply_to_original: false,
+            thread_replies: false,
+            silent_messages: true,
+            backend_concurrency: 2,
+        };
+
+        let effective = effective_translation_config(&default, &rooms, "!room:example.org");
+        assert_eq!(effective.langs, vec!["de", "uk"]);
+        assert_eq!(effective.min_confidence, 0.8);
+        assert!(!effective.reply_to_original);
+        assert!(!effective.thread_replies);
+        assert!(effective.silent_messages);
+    }
+
+    #[test]
+    fn room_translation_unknown_room_uses_default() {
+        let mut rooms = HashMap::new();
+        rooms.insert(
+            "!room:example.org".to_owned(),
+            RoomTranslationConfig {
+                langs: Some(vec!["de".to_owned(), "uk".to_owned()]),
+                ..Default::default()
+            },
+        );
+
+        let default = TranslationConfig::default();
+        let effective = effective_translation_config(&default, &rooms, "!other:example.org");
+
+        assert_eq!(effective.langs, default.langs);
+        assert_eq!(effective.min_confidence, default.min_confidence);
+        assert_eq!(effective.reply_to_original, default.reply_to_original);
+        assert_eq!(effective.thread_replies, default.thread_replies);
+        assert_eq!(effective.silent_messages, default.silent_messages);
+    }
+
     // ── Serde / default-value proof ───────────────────────────────────────────
     //
     // These tests prove the exact path taken when reply_to_original is absent
@@ -922,6 +1014,39 @@ reply_to_original = true"#;
             cfg.reply_to_original,
             "absent key must default to true via default_true()"
         );
+    }
+
+    #[test]
+    fn serde_room_translation_overrides_parse_from_config() {
+        let toml = r#"
+[matrix]
+homeserver = "https://matrix.org"
+user_id = "@bot:example.org"
+access_token = "token"
+device_id = "DEVICE"
+
+[libretranslate]
+url = "http://localhost:5000"
+
+[translation]
+langs = ["en", "de", "uk"]
+silent_messages = true
+
+[room_translations."!room:example.org"]
+langs = ["de", "uk"]
+min_confidence = 0.7
+"#;
+
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let effective = effective_translation_config(
+            &cfg.translation,
+            &cfg.room_translations,
+            "!room:example.org",
+        );
+
+        assert_eq!(effective.langs, vec!["de", "uk"]);
+        assert_eq!(effective.min_confidence, 0.7);
+        assert!(effective.silent_messages);
     }
 
     #[test]
@@ -1387,11 +1512,17 @@ async fn handle_image_caption(
         room.room_id()
     );
 
-    if confidence < state.min_confidence || !state.langs.contains(&lang) {
+    let translation = state.translation_for_room(room.room_id().as_str());
+
+    if confidence < translation.min_confidence || !translation.langs.contains(&lang) {
         return;
     }
 
-    let targets: Vec<&String> = state.langs.iter().filter(|t| t.as_str() != lang).collect();
+    let targets: Vec<&String> = translation
+        .langs
+        .iter()
+        .filter(|t| t.as_str() != lang)
+        .collect();
     if targets.is_empty() {
         return;
     }
@@ -1417,15 +1548,18 @@ async fn handle_image_caption(
     }
 
     let plain_body = plain_lines.join("\n");
-    let mut content =
-        make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
+    let mut content = make_translation_content(
+        plain_body,
+        html_lines.join("<br>\n"),
+        translation.silent_messages,
+    );
     let in_thread = matches!(&event.content.relates_to, Some(Relation::Thread(_)));
     let thread_root = resolve_thread_root(&event);
     content.relates_to = make_relation(
         &event.event_id,
         &thread_root,
-        state.reply_to_original,
-        state.thread_replies,
+        translation.reply_to_original,
+        translation.thread_replies,
         in_thread,
     );
 
@@ -1525,11 +1659,17 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         room.room_id()
     );
 
-    if confidence < state.min_confidence || !state.langs.contains(&lang) {
+    let translation = state.translation_for_room(room.room_id().as_str());
+
+    if confidence < translation.min_confidence || !translation.langs.contains(&lang) {
         return;
     }
 
-    let targets: Vec<&String> = state.langs.iter().filter(|t| t.as_str() != lang).collect();
+    let targets: Vec<&String> = translation
+        .langs
+        .iter()
+        .filter(|t| t.as_str() != lang)
+        .collect();
     if targets.is_empty() {
         return;
     }
@@ -1566,18 +1706,21 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
     }
 
     let plain_body = plain_lines.join("\n");
-    let mut content =
-        make_translation_content(plain_body, html_lines.join("<br>\n"), state.silent_messages);
+    let mut content = make_translation_content(
+        plain_body,
+        html_lines.join("<br>\n"),
+        translation.silent_messages,
+    );
     let in_thread = matches!(&event.content.relates_to, Some(Relation::Thread(_)));
     let thread_root = resolve_thread_root(&event);
-    if state.reply_to_original && (state.thread_replies || in_thread) {
+    if translation.reply_to_original && (translation.thread_replies || in_thread) {
         info!("thread_root={} for event={}", thread_root, event.event_id);
     }
     content.relates_to = make_relation(
         &event.event_id,
         &thread_root,
-        state.reply_to_original,
-        state.thread_replies,
+        translation.reply_to_original,
+        translation.thread_replies,
         in_thread,
     );
 
@@ -1661,11 +1804,17 @@ async fn handle_edit(
         return;
     };
 
-    if confidence < state.min_confidence || !state.langs.contains(&lang) {
+    let translation = state.translation_for_room(room.room_id().as_str());
+
+    if confidence < translation.min_confidence || !translation.langs.contains(&lang) {
         return;
     }
 
-    let targets: Vec<&String> = state.langs.iter().filter(|t| t.as_str() != lang).collect();
+    let targets: Vec<&String> = translation
+        .langs
+        .iter()
+        .filter(|t| t.as_str() != lang)
+        .collect();
     if targets.is_empty() {
         return;
     }
@@ -1689,7 +1838,7 @@ async fn handle_edit(
     // Build m.replace pointing at the bot's existing translation event.
     // The thread membership is inherited from bot_event_id — no thread relation needed here.
     // Preserve the same msgtype (m.notice vs m.text) as the original translation.
-    let inner_msgtype = if state.silent_messages {
+    let inner_msgtype = if translation.silent_messages {
         MessageType::Notice(NoticeMessageEventContent::html(
             new_body.clone(),
             new_html.clone(),
@@ -1701,8 +1850,11 @@ async fn handle_edit(
         ))
     };
     let new_without = RoomMessageEventContentWithoutRelation::new(inner_msgtype);
-    let mut edit_content =
-        make_translation_content(format!("* {new_body}"), new_html, state.silent_messages);
+    let mut edit_content = make_translation_content(
+        format!("* {new_body}"),
+        new_html,
+        translation.silent_messages,
+    );
     edit_content.relates_to = Some(Relation::Replacement(Replacement::new(
         bot_event_id.clone(),
         new_without,
