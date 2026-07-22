@@ -1,5 +1,8 @@
+#![allow(clippy::items_after_test_module)]
+
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::PathBuf,
     sync::{Arc, RwLock},
     time::{Duration, SystemTime},
@@ -58,7 +61,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
     sync::{Mutex, Semaphore},
-    time::sleep,
+    time::{sleep, timeout},
 };
 use tracing::{error, info, warn};
 
@@ -105,6 +108,18 @@ struct TranslationConfig {
     /// Maximum concurrent requests to the translation backend.
     #[serde(default = "default_backend_concurrency")]
     backend_concurrency: usize,
+    /// Timeout for a single backend translation request.
+    #[serde(default = "default_translation_request_timeout_secs")]
+    request_timeout_secs: u64,
+    /// Maximum attempts for a single target language.
+    #[serde(default = "default_translation_max_attempts")]
+    max_attempts: usize,
+    /// Initial retry backoff in milliseconds. Backoff doubles after each retry.
+    #[serde(default = "default_translation_retry_initial_backoff_ms")]
+    retry_initial_backoff_ms: u64,
+    /// Overall deadline for translating one Matrix event into all targets.
+    #[serde(default = "default_translation_overall_timeout_secs")]
+    overall_timeout_secs: u64,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -141,6 +156,22 @@ fn default_backend_concurrency() -> usize {
     4
 }
 
+fn default_translation_request_timeout_secs() -> u64 {
+    60
+}
+
+fn default_translation_max_attempts() -> usize {
+    3
+}
+
+fn default_translation_retry_initial_backoff_ms() -> u64 {
+    250
+}
+
+fn default_translation_overall_timeout_secs() -> u64 {
+    90
+}
+
 impl Default for TranslationConfig {
     fn default() -> Self {
         Self {
@@ -150,6 +181,10 @@ impl Default for TranslationConfig {
             thread_replies: true,
             silent_messages: false,
             backend_concurrency: default_backend_concurrency(),
+            request_timeout_secs: default_translation_request_timeout_secs(),
+            max_attempts: default_translation_max_attempts(),
+            retry_initial_backoff_ms: default_translation_retry_initial_backoff_ms(),
+            overall_timeout_secs: default_translation_overall_timeout_secs(),
         }
     }
 }
@@ -208,6 +243,106 @@ struct TranslateResponse {
     translated_text: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TranslationErrorKind {
+    Timeout,
+    Request,
+    HttpStatus(u16),
+    BackendBusy,
+    ResponseParse,
+    Empty,
+    Rejected,
+    OverallTimeout,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranslationError {
+    kind: TranslationErrorKind,
+    detail: String,
+}
+
+impl TranslationError {
+    fn new(kind: TranslationErrorKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    fn is_transient(&self) -> bool {
+        match self.kind {
+            TranslationErrorKind::Timeout
+            | TranslationErrorKind::Request
+            | TranslationErrorKind::BackendBusy => true,
+            TranslationErrorKind::HttpStatus(status) => status == 429 || status >= 500,
+            TranslationErrorKind::ResponseParse
+            | TranslationErrorKind::Empty
+            | TranslationErrorKind::Rejected
+            | TranslationErrorKind::OverallTimeout => false,
+        }
+    }
+
+    fn class(&self) -> &'static str {
+        match self.kind {
+            TranslationErrorKind::Timeout => "timeout",
+            TranslationErrorKind::Request => "backend_request_error",
+            TranslationErrorKind::HttpStatus(_) => "backend_http_error",
+            TranslationErrorKind::BackendBusy => "backend_busy",
+            TranslationErrorKind::ResponseParse => "response_parse_error",
+            TranslationErrorKind::Empty => "empty_response",
+            TranslationErrorKind::Rejected => "validation_rejected",
+            TranslationErrorKind::OverallTimeout => "overall_timeout",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranslationRetryPolicy {
+    request_timeout: Duration,
+    max_attempts: usize,
+    initial_backoff: Duration,
+    overall_timeout: Duration,
+}
+
+impl TranslationRetryPolicy {
+    fn from_config(config: &TranslationConfig) -> Self {
+        Self {
+            request_timeout: Duration::from_secs(config.request_timeout_secs.max(1)),
+            max_attempts: config.max_attempts.max(1),
+            initial_backoff: Duration::from_millis(config.retry_initial_backoff_ms),
+            overall_timeout: Duration::from_secs(config.overall_timeout_secs.max(1)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranslatedLine {
+    target: String,
+    plain: String,
+    html: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TargetTranslationFailure {
+    target: String,
+    attempts: usize,
+    error: TranslationError,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranslationBatchFailure {
+    source: String,
+    context: &'static str,
+    failed_targets: Vec<TargetTranslationFailure>,
+    suppressed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TranslationInput<'a> {
+    Text { plain: &'a str },
+    Html { html: &'a str, plain: &'a str },
+}
+
 #[derive(Clone)]
 struct BotState {
     lt_url: String,
@@ -234,6 +369,10 @@ struct BotState {
 impl BotState {
     fn translation_for_room(&self, room_id: &str) -> EffectiveTranslationConfig {
         effective_translation_config(&self.translation, &self.room_translations, room_id)
+    }
+
+    fn retry_policy(&self) -> TranslationRetryPolicy {
+        TranslationRetryPolicy::from_config(&self.translation)
     }
 
     async fn detect(&self, text: &str) -> Option<(String, f64)> {
@@ -278,41 +417,226 @@ impl BotState {
         source: &str,
         target: &str,
         format: &str,
-    ) -> Option<String> {
-        let _permit = self
-            .lt_requests
-            .acquire()
-            .await
-            .map_err(|e| warn!("ltengine request limiter closed: {e}"))
-            .ok()?;
-        let resp = self
-            .http
-            .post(format!("{}/translate", self.lt_url))
-            .json(&TranslateRequest {
-                q: text,
-                source,
-                target,
-                format,
-                api_key: self.lt_api_key.as_deref(),
-            })
-            .send()
-            .await
-            .map_err(|e| {
-                warn!("ltengine /translate request error (src={source} tgt={target}): {e}")
-            })
-            .ok()?
-            .error_for_status()
-            .map_err(|e| {
-                warn!("ltengine /translate returned error status (src={source} tgt={target}): {e}")
-            })
-            .ok()?;
-        let result: TranslateResponse = resp
-            .json()
-            .await
-            .map_err(|e| warn!("ltengine /translate response parse error: {e}"))
-            .ok()?;
-        Some(result.translated_text)
+    ) -> Result<String, TranslationError> {
+        let _permit = self.lt_requests.acquire().await.map_err(|e| {
+            warn!("ltengine request limiter closed: {e}");
+            TranslationError::new(TranslationErrorKind::Request, e.to_string())
+        })?;
+
+        let request_timeout = self.retry_policy().request_timeout;
+        let request = async {
+            let resp = self
+                .http
+                .post(format!("{}/translate", self.lt_url))
+                .json(&TranslateRequest {
+                    q: text,
+                    source,
+                    target,
+                    format,
+                    api_key: self.lt_api_key.as_deref(),
+                })
+                .send()
+                .await
+                .map_err(|e| TranslationError::new(TranslationErrorKind::Request, e.to_string()))?;
+
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| TranslationError::new(TranslationErrorKind::Request, e.to_string()))?;
+
+            if !status.is_success() {
+                let kind = if is_backend_busy_body(&body) {
+                    TranslationErrorKind::BackendBusy
+                } else {
+                    TranslationErrorKind::HttpStatus(status.as_u16())
+                };
+                return Err(TranslationError::new(kind, response_excerpt(&body)));
+            }
+
+            match serde_json::from_str::<TranslateResponse>(&body) {
+                Ok(result) => Ok(result.translated_text),
+                Err(e) if is_backend_busy_body(&body) => Err(TranslationError::new(
+                    TranslationErrorKind::BackendBusy,
+                    response_excerpt(&body),
+                )),
+                Err(e) => Err(TranslationError::new(
+                    TranslationErrorKind::ResponseParse,
+                    format!("{e}; body={}", response_excerpt(&body)),
+                )),
+            }
+        };
+
+        with_translation_timeout(request_timeout, request).await
     }
+}
+
+async fn with_translation_timeout<T, Fut>(
+    request_timeout: Duration,
+    future: Fut,
+) -> Result<T, TranslationError>
+where
+    Fut: Future<Output = Result<T, TranslationError>>,
+{
+    timeout(request_timeout, future).await.map_err(|_| {
+        TranslationError::new(
+            TranslationErrorKind::Timeout,
+            format!("request exceeded {}s", request_timeout.as_secs()),
+        )
+    })?
+}
+
+fn is_backend_busy_body(body: &str) -> bool {
+    body.to_lowercase().contains("server busy")
+}
+
+fn response_excerpt(body: &str) -> String {
+    const MAX: usize = 240;
+    let mut out: String = body.chars().take(MAX).collect();
+    if body.chars().count() > MAX {
+        out.push_str("...");
+    }
+    out
+}
+
+async fn retry_translation_operation<T, Op, Fut>(
+    target: &str,
+    policy: &TranslationRetryPolicy,
+    attempts_by_target: Arc<Mutex<HashMap<String, usize>>>,
+    mut op: Op,
+) -> Result<T, TargetTranslationFailure>
+where
+    Op: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, TranslationError>>,
+{
+    let mut attempts = 0usize;
+    let mut backoff = policy.initial_backoff;
+
+    loop {
+        attempts += 1;
+        attempts_by_target
+            .lock()
+            .await
+            .insert(target.to_owned(), attempts);
+
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempts < policy.max_attempts && error.is_transient() => {
+                warn!(
+                    "Translation target={target} failed transiently attempt={attempts}/{} class={} detail={} — retrying",
+                    policy.max_attempts,
+                    error.class(),
+                    error.detail
+                );
+                if !backoff.is_zero() {
+                    sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2);
+                }
+            }
+            Err(error) => {
+                return Err(TargetTranslationFailure {
+                    target: target.to_owned(),
+                    attempts,
+                    error,
+                });
+            }
+        }
+    }
+}
+
+async fn collect_all_or_nothing<Fut>(
+    source: &str,
+    target_langs: &[String],
+    context: &'static str,
+    overall_timeout: Duration,
+    attempts_by_target: Arc<Mutex<HashMap<String, usize>>>,
+    futures: Vec<Fut>,
+) -> Result<Vec<TranslatedLine>, TranslationBatchFailure>
+where
+    Fut: Future<Output = Result<TranslatedLine, TargetTranslationFailure>>,
+{
+    match timeout(overall_timeout, join_all(futures)).await {
+        Ok(results) => {
+            let mut lines = Vec::new();
+            let mut failures = Vec::new();
+            for result in results {
+                match result {
+                    Ok(line) => lines.push(line),
+                    Err(failure) => failures.push(failure),
+                }
+            }
+
+            if failures.is_empty() {
+                Ok(lines)
+            } else {
+                Err(TranslationBatchFailure {
+                    source: source.to_owned(),
+                    context,
+                    failed_targets: failures,
+                    suppressed: true,
+                })
+            }
+        }
+        Err(_) => {
+            let attempts = attempts_by_target.lock().await.clone();
+            let failed_targets = target_langs
+                .iter()
+                .map(|target| TargetTranslationFailure {
+                    target: target.clone(),
+                    attempts: attempts.get(target).copied().unwrap_or(0),
+                    error: TranslationError::new(
+                        TranslationErrorKind::OverallTimeout,
+                        format!(
+                            "overall deadline exceeded after {}s",
+                            overall_timeout.as_secs()
+                        ),
+                    ),
+                })
+                .collect();
+
+            Err(TranslationBatchFailure {
+                source: source.to_owned(),
+                context,
+                failed_targets,
+                suppressed: true,
+            })
+        }
+    }
+}
+
+fn log_suppressed_translation(failure: &TranslationBatchFailure) {
+    let failed = failure
+        .failed_targets
+        .iter()
+        .map(|failure| {
+            format!(
+                "{} attempts={} class={} detail={}",
+                failure.target,
+                failure.attempts,
+                failure.error.class(),
+                failure.error.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    warn!(
+        "Translation suppressed context={} source_lang={} failed_targets=[{}] suppressed={}",
+        failure.context, failure.source, failed, failure.suppressed
+    );
+}
+
+fn build_translation_bodies(lines: &[TranslatedLine]) -> (String, String) {
+    let plain_lines = lines
+        .iter()
+        .map(|line| format!("{} {}", flag_for_lang(&line.target), line.plain))
+        .collect::<Vec<_>>();
+    let html_lines = lines
+        .iter()
+        .map(|line| format!("{} {}", flag_for_lang(&line.target), line.html))
+        .collect::<Vec<_>>();
+
+    (plain_lines.join("\n"), html_lines.join("<br>\n"))
 }
 
 #[tokio::main]
@@ -626,6 +950,273 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::future::{BoxFuture, FutureExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_policy() -> TranslationRetryPolicy {
+        TranslationRetryPolicy {
+            request_timeout: Duration::from_millis(20),
+            max_attempts: 3,
+            initial_backoff: Duration::ZERO,
+            overall_timeout: Duration::from_millis(100),
+        }
+    }
+
+    fn test_line(target: &str) -> TranslatedLine {
+        TranslatedLine {
+            target: target.to_owned(),
+            plain: format!("{target} plain"),
+            html: format!("{target} html"),
+        }
+    }
+
+    fn test_failure(
+        target: &str,
+        attempts: usize,
+        kind: TranslationErrorKind,
+    ) -> TargetTranslationFailure {
+        TargetTranslationFailure {
+            target: target.to_owned(),
+            attempts,
+            error: TranslationError::new(kind, "test failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn all_targets_succeed_first_attempt() {
+        let targets = vec!["en".to_owned(), "uk".to_owned()];
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let futures: Vec<BoxFuture<'static, Result<TranslatedLine, TargetTranslationFailure>>> =
+            targets
+                .iter()
+                .map(|target| {
+                    let target = target.clone();
+                    async move { Ok(test_line(&target)) }.boxed()
+                })
+                .collect::<Vec<_>>();
+
+        let result = collect_all_or_nothing(
+            "de",
+            &targets,
+            "message",
+            Duration::from_millis(100),
+            attempts,
+            futures,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].target, "en");
+        assert_eq!(result[1].target, "uk");
+    }
+
+    #[tokio::test]
+    async fn transient_failure_succeeds_on_retry() {
+        let policy = test_policy();
+        let attempts_by_target = Arc::new(Mutex::new(HashMap::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_op = Arc::clone(&calls);
+
+        let line = retry_translation_operation("en", &policy, attempts_by_target, move || {
+            let calls_for_op = Arc::clone(&calls_for_op);
+            async move {
+                let call = calls_for_op.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Err(TranslationError::new(
+                        TranslationErrorKind::BackendBusy,
+                        "Server busy, please try again later",
+                    ))
+                } else {
+                    Ok(test_line("en"))
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(line.target, "en");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn continued_target_failure_suppresses_partial_batch() {
+        let targets = vec!["en".to_owned(), "uk".to_owned()];
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let futures: Vec<BoxFuture<'static, Result<TranslatedLine, TargetTranslationFailure>>> = vec![
+            async { Err(test_failure("en", 3, TranslationErrorKind::BackendBusy)) }.boxed(),
+            async { Ok(test_line("uk")) }.boxed(),
+        ];
+
+        let failure = collect_all_or_nothing(
+            "de",
+            &targets,
+            "message",
+            Duration::from_millis(100),
+            attempts,
+            futures,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(failure.suppressed);
+        assert_eq!(failure.source, "de");
+        assert_eq!(failure.failed_targets.len(), 1);
+        assert_eq!(failure.failed_targets[0].target, "en");
+    }
+
+    #[tokio::test]
+    async fn per_request_timeout_is_classified() {
+        let result = with_translation_timeout(Duration::from_millis(5), async {
+            sleep(Duration::from_millis(25)).await;
+            Ok::<_, TranslationError>(test_line("en"))
+        })
+        .await;
+
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, TranslationErrorKind::Timeout);
+        assert!(error.is_transient());
+    }
+
+    #[tokio::test]
+    async fn overall_deadline_suppresses_partial_batch() {
+        let targets = vec!["en".to_owned(), "uk".to_owned()];
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        attempts.lock().await.insert("en".to_owned(), 1);
+        let futures: Vec<BoxFuture<'static, Result<TranslatedLine, TargetTranslationFailure>>> = vec![
+            async {
+                sleep(Duration::from_millis(50)).await;
+                Ok(test_line("en"))
+            }
+            .boxed(),
+            async { Ok(test_line("uk")) }.boxed(),
+        ];
+
+        let failure = collect_all_or_nothing(
+            "de",
+            &targets,
+            "message",
+            Duration::from_millis(10),
+            attempts,
+            futures,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(failure.suppressed);
+        assert!(failure
+            .failed_targets
+            .iter()
+            .all(|target| target.error.kind == TranslationErrorKind::OverallTimeout));
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_is_not_retried_excessively() {
+        let policy = test_policy();
+        let attempts_by_target = Arc::new(Mutex::new(HashMap::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_op = Arc::clone(&calls);
+
+        let failure = retry_translation_operation("en", &policy, attempts_by_target, move || {
+            let calls_for_op = Arc::clone(&calls_for_op);
+            async move {
+                calls_for_op.fetch_add(1, Ordering::SeqCst);
+                Err::<TranslatedLine, _>(TranslationError::new(
+                    TranslationErrorKind::ResponseParse,
+                    "malformed success response",
+                ))
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(failure.attempts, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_return_single_batch_without_duplicates() {
+        let policy = test_policy();
+        let attempts_by_target = Arc::new(Mutex::new(HashMap::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_op = Arc::clone(&calls);
+        let target = "en".to_owned();
+
+        let retried = retry_translation_operation("en", &policy, attempts_by_target, move || {
+            let calls_for_op = Arc::clone(&calls_for_op);
+            async move {
+                let call = calls_for_op.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Err(TranslationError::new(
+                        TranslationErrorKind::Timeout,
+                        "timed out",
+                    ))
+                } else {
+                    Ok(test_line("en"))
+                }
+            }
+        });
+        let futures: Vec<BoxFuture<'_, Result<TranslatedLine, TargetTranslationFailure>>> =
+            vec![retried.boxed()];
+        let targets = vec![target];
+        let lines = collect_all_or_nothing(
+            "de",
+            &targets,
+            "message",
+            Duration::from_millis(100),
+            Arc::new(Mutex::new(HashMap::new())),
+            futures,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn formatting_is_shared_for_message_caption_and_edit_paths() {
+        let lines = vec![test_line("en"), test_line("uk")];
+        let (plain, html) = build_translation_bodies(&lines);
+
+        assert_eq!(plain, "🇬🇧 en plain\n🇺🇦 uk plain");
+        assert_eq!(html, "🇬🇧 en html<br>\n🇺🇦 uk html");
+    }
+
+    #[test]
+    fn batch_failure_status_records_suppressed_partial_translation() {
+        let failure = TranslationBatchFailure {
+            source: "de".to_owned(),
+            context: "message",
+            failed_targets: vec![test_failure("en", 3, TranslationErrorKind::BackendBusy)],
+            suppressed: true,
+        };
+
+        assert!(failure.suppressed);
+        assert_eq!(failure.failed_targets[0].attempts, 3);
+        assert_eq!(failure.failed_targets[0].error.class(), "backend_busy");
+    }
+
+    #[test]
+    fn error_classification_retries_only_transient_failures() {
+        assert!(TranslationError::new(TranslationErrorKind::Timeout, "timeout").is_transient());
+        assert!(TranslationError::new(TranslationErrorKind::Request, "connection").is_transient());
+        assert!(TranslationError::new(TranslationErrorKind::BackendBusy, "busy").is_transient());
+        assert!(
+            TranslationError::new(TranslationErrorKind::HttpStatus(429), "rate").is_transient()
+        );
+        assert!(
+            TranslationError::new(TranslationErrorKind::HttpStatus(503), "down").is_transient()
+        );
+
+        assert!(
+            !TranslationError::new(TranslationErrorKind::HttpStatus(400), "bad").is_transient()
+        );
+        assert!(
+            !TranslationError::new(TranslationErrorKind::ResponseParse, "bad json").is_transient()
+        );
+        assert!(!TranslationError::new(TranslationErrorKind::Rejected, "guard").is_transient());
+    }
 
     #[test]
     fn render_html_bold_italic() {
@@ -927,6 +1518,10 @@ mod tests {
             cfg.backend_concurrency, 4,
             "default: backend_concurrency must be 4"
         );
+        assert_eq!(cfg.request_timeout_secs, 60);
+        assert_eq!(cfg.max_attempts, 3);
+        assert_eq!(cfg.retry_initial_backoff_ms, 250);
+        assert_eq!(cfg.overall_timeout_secs, 90);
     }
 
     #[test]
@@ -947,6 +1542,10 @@ mod tests {
             thread_replies: false,
             silent_messages: true,
             backend_concurrency: 2,
+            request_timeout_secs: 60,
+            max_attempts: 3,
+            retry_initial_backoff_ms: 250,
+            overall_timeout_secs: 90,
         };
 
         let effective = effective_translation_config(&default, &rooms, "!room:example.org");
@@ -1230,6 +1829,7 @@ min_confidence = 0.7
 /// node that sits outside a code block.  These are the nodes that should be
 /// translated; all other events (code blocks, inline code, HTML, URLs) are
 /// left untouched.
+#[allow(dead_code)]
 fn render_html(markdown: &str) -> String {
     let opts = Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TABLES
@@ -1371,76 +1971,159 @@ fn strip_mx_reply(html: &str) -> String {
     html.to_owned()
 }
 
-/// Core translation call: send pre-rendered HTML to LibreTranslate and return
-/// `(plain_body, formatted_html)`.  Used by both text and image-caption paths.
-async fn translate_html_content(
-    state: &BotState,
-    html: &str,
-    source: &str,
+fn build_text_line(
     target: &str,
-) -> Option<(String, String)> {
-    match state.translate(html, source, target, "html").await {
-        Some(translated_html) => {
-            let source_plain = html_to_plain(html);
-            let plain = html_to_plain(&translated_html);
-            if plain.is_empty() {
-                warn!("Translation to {target} produced empty text — skipping");
-                return None;
-            }
-            if let Some(reason) = translation_rejection_reason(&source_plain, &plain) {
-                warn!("Translation to {target} rejected: {reason}");
-                return None;
-            }
-            Some((plain, inline_html(&translated_html)))
-        }
-        None => {
-            warn!("Translation failed for target={target} — skipping");
-            None
-        }
+    source_plain: &str,
+    translated: String,
+) -> Result<TranslatedLine, TranslationError> {
+    let translated = translated.trim().to_owned();
+    if translated.is_empty() {
+        return Err(TranslationError::new(
+            TranslationErrorKind::Empty,
+            "translation produced empty text",
+        ));
     }
+    if let Some(reason) = translation_rejection_reason(source_plain, &translated) {
+        return Err(TranslationError::new(
+            TranslationErrorKind::Rejected,
+            reason,
+        ));
+    }
+    Ok(TranslatedLine {
+        target: target.to_owned(),
+        plain: translated.clone(),
+        html: translated,
+    })
 }
 
-/// Try HTML translation first; if it produces empty output (e.g. model can't handle
-/// the language+HTML combo), fall back to translating `plain` as plain text.
-async fn translate_html_with_fallback(
+fn build_html_line(
+    target: &str,
+    source_plain: &str,
+    translated_html: String,
+) -> Result<TranslatedLine, TranslationError> {
+    let plain = html_to_plain(&translated_html);
+    if plain.is_empty() {
+        return Err(TranslationError::new(
+            TranslationErrorKind::Empty,
+            "translation produced empty text",
+        ));
+    }
+    if let Some(reason) = translation_rejection_reason(source_plain, &plain) {
+        return Err(TranslationError::new(
+            TranslationErrorKind::Rejected,
+            reason,
+        ));
+    }
+    Ok(TranslatedLine {
+        target: target.to_owned(),
+        plain,
+        html: inline_html(&translated_html),
+    })
+}
+
+async fn translate_text_target_with_retry(
+    state: &BotState,
+    plain: &str,
+    source: &str,
+    target: &str,
+    attempts_by_target: Arc<Mutex<HashMap<String, usize>>>,
+) -> Result<TranslatedLine, TargetTranslationFailure> {
+    let policy = state.retry_policy();
+    retry_translation_operation(target, &policy, attempts_by_target, || async {
+        let translated = state.translate(plain, source, target, "text").await?;
+        build_text_line(target, plain, translated)
+    })
+    .await
+}
+
+async fn translate_html_target_with_retry(
     state: &BotState,
     html: &str,
     plain: &str,
     source: &str,
     target: &str,
-) -> Option<(String, String)> {
-    if let Some(result) = translate_html_content(state, html, source, target).await {
-        return Some(result);
+    attempts_by_target: Arc<Mutex<HashMap<String, usize>>>,
+) -> Result<TranslatedLine, TargetTranslationFailure> {
+    let policy = state.retry_policy();
+    let source_plain = html_to_plain(html);
+    let html_result =
+        retry_translation_operation(target, &policy, attempts_by_target.clone(), || async {
+            let translated_html = state.translate(html, source, target, "html").await?;
+            build_html_line(target, &source_plain, translated_html)
+        })
+        .await;
+
+    match html_result {
+        Ok(line) => Ok(line),
+        Err(html_failure) => {
+            warn!(
+                "HTML translation target={} failed after {} attempts class={} detail={} — falling back to text",
+                html_failure.target,
+                html_failure.attempts,
+                html_failure.error.class(),
+                html_failure.error.detail
+            );
+            translate_text_target_with_retry(state, plain, source, target, attempts_by_target).await
+        }
     }
-    // Plain-text fallback — no formatting preserved, but at least we get a translation.
-    let translated = state.translate(plain, source, target, "text").await?;
-    let translated = translated.trim().to_owned();
-    if translated.is_empty() {
-        return None;
-    }
-    if let Some(reason) = translation_rejection_reason(plain, &translated) {
-        warn!("Plain-text translation to {target} rejected: {reason}");
-        return None;
-    }
-    Some((translated.clone(), translated))
 }
 
-async fn translate_text_content(
+async fn translate_all_targets(
     state: &BotState,
-    plain: &str,
+    input: TranslationInput<'_>,
     source: &str,
-    target: &str,
-) -> Option<(String, String)> {
-    let translated = state.translate(plain, source, target, "text").await?;
-    let translated = translated.trim().to_owned();
-    if translated.is_empty() {
-        return None;
+    target_langs: Vec<String>,
+    context: &'static str,
+) -> Result<Vec<TranslatedLine>, TranslationBatchFailure> {
+    let policy = state.retry_policy();
+    let attempts_by_target = Arc::new(Mutex::new(HashMap::new()));
+    let futures = target_langs
+        .iter()
+        .map(|target| {
+            let attempts_by_target = Arc::clone(&attempts_by_target);
+            async move {
+                match input {
+                    TranslationInput::Text { plain } => {
+                        translate_text_target_with_retry(
+                            state,
+                            plain,
+                            source,
+                            target,
+                            attempts_by_target,
+                        )
+                        .await
+                    }
+                    TranslationInput::Html { html, plain } => {
+                        translate_html_target_with_retry(
+                            state,
+                            html,
+                            plain,
+                            source,
+                            target,
+                            attempts_by_target,
+                        )
+                        .await
+                    }
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let result = collect_all_or_nothing(
+        source,
+        &target_langs,
+        context,
+        policy.overall_timeout,
+        attempts_by_target,
+        futures,
+    )
+    .await;
+
+    if let Err(ref failure) = result {
+        log_suppressed_translation(failure);
     }
-    if let Some(reason) = translation_rejection_reason(plain, &translated) {
-        warn!("Text translation to {target} rejected: {reason}");
-        return None;
-    }
-    Some((translated.clone(), translated))
+
+    result
 }
 
 /// Compute the `relates_to` relation for a translation message.
@@ -1518,41 +2201,30 @@ async fn handle_image_caption(
         return;
     }
 
-    let targets: Vec<&String> = translation
+    let targets: Vec<String> = translation
         .langs
         .iter()
         .filter(|t| t.as_str() != lang)
+        .cloned()
         .collect();
     if targets.is_empty() {
         return;
     }
 
-    let results = join_all(
-        targets
-            .iter()
-            .map(|target| translate_text_content(&state, &caption, &lang, target)),
+    let lines = match translate_all_targets(
+        &state,
+        TranslationInput::Text { plain: &caption },
+        &lang,
+        targets,
+        "image_caption",
     )
-    .await;
-    let mut plain_lines = Vec::new();
-    let mut html_lines = Vec::new();
-    for (target, result) in targets.iter().zip(results) {
-        if let Some((plain, html)) = result {
-            let flag = flag_for_lang(target);
-            plain_lines.push(format!("{flag} {plain}"));
-            html_lines.push(format!("{flag} {html}"));
-        }
-    }
-
-    if plain_lines.is_empty() {
-        return;
-    }
-
-    let plain_body = plain_lines.join("\n");
-    let mut content = make_translation_content(
-        plain_body,
-        html_lines.join("<br>\n"),
-        translation.silent_messages,
-    );
+    .await
+    {
+        Ok(lines) => lines,
+        Err(_) => return,
+    };
+    let (plain_body, html_body) = build_translation_bodies(&lines);
+    let mut content = make_translation_content(plain_body, html_body, translation.silent_messages);
     let in_thread = matches!(&event.content.relates_to, Some(Relation::Thread(_)));
     let thread_root = resolve_thread_root(&event);
     content.relates_to = make_relation(
@@ -1665,52 +2337,30 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         return;
     }
 
-    let targets: Vec<&String> = translation
+    let targets: Vec<String> = translation
         .langs
         .iter()
         .filter(|t| t.as_str() != lang)
+        .cloned()
         .collect();
     if targets.is_empty() {
         return;
     }
 
-    let results = match &text_content.formatted {
-        Some(fb) if fb.format == MessageFormat::Html => {
-            let html_to_translate = strip_mx_reply(&fb.body);
-            join_all(targets.iter().map(|target| {
-                translate_html_with_fallback(&state, &html_to_translate, text, &lang, target)
-            }))
-            .await
-        }
-        _ => {
-            join_all(
-                targets
-                    .iter()
-                    .map(|target| translate_text_content(&state, text, &lang, target)),
-            )
-            .await
-        }
+    let html_to_translate = match &text_content.formatted {
+        Some(fb) if fb.format == MessageFormat::Html => Some(strip_mx_reply(&fb.body)),
+        _ => None,
     };
-    let mut plain_lines = Vec::new();
-    let mut html_lines = Vec::new();
-    for (target, result) in targets.iter().zip(results) {
-        if let Some((plain, html)) = result {
-            let flag = flag_for_lang(target);
-            plain_lines.push(format!("{flag} {plain}"));
-            html_lines.push(format!("{flag} {html}"));
-        }
-    }
-
-    if plain_lines.is_empty() {
-        return;
-    }
-
-    let plain_body = plain_lines.join("\n");
-    let mut content = make_translation_content(
-        plain_body,
-        html_lines.join("<br>\n"),
-        translation.silent_messages,
-    );
+    let input = match html_to_translate.as_deref() {
+        Some(html) => TranslationInput::Html { html, plain: text },
+        None => TranslationInput::Text { plain: text },
+    };
+    let lines = match translate_all_targets(&state, input, &lang, targets, "message").await {
+        Ok(lines) => lines,
+        Err(_) => return,
+    };
+    let (plain_body, html_body) = build_translation_bodies(&lines);
+    let mut content = make_translation_content(plain_body, html_body, translation.silent_messages);
     let in_thread = matches!(&event.content.relates_to, Some(Relation::Thread(_)));
     let thread_root = resolve_thread_root(&event);
     if translation.reply_to_original && (translation.thread_replies || in_thread) {
@@ -1810,30 +2460,29 @@ async fn handle_edit(
         return;
     }
 
-    let targets: Vec<&String> = translation
+    let targets: Vec<String> = translation
         .langs
         .iter()
         .filter(|t| t.as_str() != lang)
+        .cloned()
         .collect();
     if targets.is_empty() {
         return;
     }
 
-    let mut plain_lines = Vec::new();
-    let mut html_lines = Vec::new();
-    for target in &targets {
-        if let Some((plain, html)) = translate_text_content(&state, text, &lang, target).await {
-            let flag = flag_for_lang(target);
-            plain_lines.push(format!("{flag} {plain}"));
-            html_lines.push(format!("{flag} {html}"));
-        }
-    }
-    if plain_lines.is_empty() {
-        return;
-    }
-
-    let new_body = plain_lines.join("\n");
-    let new_html = html_lines.join("<br>\n");
+    let lines = match translate_all_targets(
+        &state,
+        TranslationInput::Text { plain: text },
+        &lang,
+        targets,
+        "edit",
+    )
+    .await
+    {
+        Ok(lines) => lines,
+        Err(_) => return,
+    };
+    let (new_body, new_html) = build_translation_bodies(&lines);
 
     // Build m.replace pointing at the bot's existing translation event.
     // The thread membership is inherited from bot_event_id — no thread relation needed here.

@@ -43,6 +43,14 @@ min_confidence = 0.5
 # Maximum concurrent requests to LibreTranslate/ltengine across detection and
 # translation. Lower this if the backend degrades under bursts.
 # backend_concurrency = 4
+# Retry and timeout policy for each Matrix message translation.
+# request_timeout_secs bounds one backend request; overall_timeout_secs bounds
+# the complete multi-target translation operation. If any required target still
+# fails after this budget, the bot sends no partial translation.
+# request_timeout_secs = 60
+# max_attempts = 3
+# retry_initial_backoff_ms = 250
+# overall_timeout_secs = 90
 
 # Optional per-room translation overrides. Keys are Matrix room IDs.
 # Any omitted field inherits from [translation].
