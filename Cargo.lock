@@ -2046,7 +2046,7 @@ dependencies = [
 [[package]]
 name = "mxbot-common"
 version = "0.1.0"
-source = "git+https://github.com/PolynomialDivision/mxbot-common#f61c15d563fb187d0d0e76dc10b2714b0a9180f9"
+source = "git+https://github.com/PolynomialDivision/mxbot-common#e65ea4770f809e62b9d6652c53ec26c8da112110"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2847,9 +2847,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
  "log",
