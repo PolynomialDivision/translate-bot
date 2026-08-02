@@ -65,6 +65,8 @@ min_confidence = 0.5
 [security]
 # Users allowed to issue !reset-trust @user:server commands.
 # Only these users can allow someone to re-verify after their first verification.
+# Administrators can also start a room-independent verification with:
+# !verify-device @user:server DEVICE_ID
 admin_users = ["@you:matrix.org"]
 
 # Only these users may invite the bot to a room.
@@ -76,3 +78,12 @@ allowed_inviters = ["@you:matrix.org"]
 #   only_trusted    — only explicitly verified devices
 #   all_devices     — all devices, no restriction
 encryption_strategy = "identity_based"
+
+[security.verification]
+# Users allowed to complete a first verification with the bot. If omitted or
+# empty, allowed_inviters is used as a compatibility fallback.
+allowed_users = ["@you:matrix.org"]
+# Verification uses SAS only. Each flow and administrative grant is bounded.
+flow_timeout_secs = 300
+grant_ttl_secs = 600
+max_concurrent = 8

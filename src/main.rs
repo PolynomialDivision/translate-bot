@@ -8,7 +8,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use mxbot_common::config::{MatrixConfig, SecurityConfig};
+use mxbot_common::{
+    config::{MatrixConfig, SecurityConfig},
+    verify::{VerificationService, VerificationSettings},
+};
 
 fn flag_for_lang(lang: &str) -> &'static str {
     match lang {
@@ -39,7 +42,6 @@ use matrix_sdk::{
     ruma::{
         api::client::filter::FilterDefinition,
         events::{
-            key::verification::request::ToDeviceKeyVerificationRequestEvent,
             relation::{InReplyTo, Replacement, Reply, Thread},
             room::{
                 member::StrippedRoomMemberEvent,
@@ -68,6 +70,17 @@ use tracing::{error, info, warn};
 const MAX_TRANSLATION_ABSOLUTE_CHARS: usize = 1_000;
 const MAX_TRANSLATION_EXPANSION_FACTOR: usize = 6;
 const MAX_TRANSLATION_EXPANSION_SLACK: usize = 80;
+
+fn parse_verify_device_arguments(
+    arguments: &str,
+) -> std::result::Result<(OwnedUserId, matrix_sdk::ruma::OwnedDeviceId), &'static str> {
+    let mut parts = arguments.split_whitespace();
+    let (Some(user), Some(device), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err("expected exactly a Matrix user ID and device ID");
+    };
+    let user_id = user.parse().map_err(|_| "invalid Matrix user ID")?;
+    Ok((user_id, matrix_sdk::ruma::OwnedDeviceId::from(device)))
+}
 
 #[derive(Deserialize)]
 struct Config {
@@ -353,9 +366,7 @@ struct BotState {
     bot_user_id: OwnedUserId,
     admin_users: HashSet<OwnedUserId>,
     allowed_inviters: HashSet<OwnedUserId>,
-    // Users allowed to re-verify despite already having a verified device.
-    // Populated by !reset-trust from an admin, cleared after use.
-    reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
+    verification: VerificationService,
     startup_time: SystemTime,
     // Maps user's original event_id → bot's translation event_id.
     // Used to edit the bot's translation when the user edits their message.
@@ -674,6 +685,17 @@ async fn main() -> Result<()> {
         .filter_map(|s| s.parse().ok())
         .collect();
 
+    let mut verification_users: HashSet<OwnedUserId> = config
+        .security
+        .verification
+        .allowed_users
+        .iter()
+        .filter_map(|user| user.parse().ok())
+        .collect();
+    if verification_users.is_empty() {
+        verification_users.clone_from(&allowed_inviters);
+    }
+
     if admin_users.is_empty() {
         warn!("No admin_users configured — !reset-trust command is disabled");
     } else {
@@ -686,8 +708,30 @@ async fn main() -> Result<()> {
         info!("Allowed inviters: {:?}", allowed_inviters);
     }
 
+    if verification_users.is_empty() {
+        warn!("No verification users configured — verification requests will require an administrative grant");
+    } else {
+        info!(
+            "Users allowed to verify with the bot: {:?}",
+            verification_users
+        );
+    }
+
     let startup_time = SystemTime::now();
     let backend_concurrency = config.translation.backend_concurrency.max(1);
+
+    let verification = VerificationService::allowlisted_tofu(
+        client.clone(),
+        verification_users,
+        VerificationSettings {
+            flow_timeout: Duration::from_secs(
+                config.security.verification.flow_timeout_secs.max(1),
+            ),
+            grant_ttl: Duration::from_secs(config.security.verification.grant_ttl_secs.max(1)),
+            max_concurrent: config.security.verification.max_concurrent.max(1),
+        },
+    );
+    verification.install_handlers();
 
     let state = BotState {
         lt_url: config.libretranslate.url.trim_end_matches('/').to_owned(),
@@ -702,7 +746,7 @@ async fn main() -> Result<()> {
         bot_user_id: user_id,
         admin_users,
         allowed_inviters,
-        reset_allowed: Arc::new(Mutex::new(HashSet::new())),
+        verification,
         translation_map: Arc::new(RwLock::new(HashMap::new())),
         inflight: Arc::new(Semaphore::new(8)),
         lt_requests: Arc::new(Semaphore::new(backend_concurrency)),
@@ -726,8 +770,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Advance the sync token past any backlog from downtime before registering
-    // handlers — events that arrived while the bot was down are silently discarded.
+    // Advance the sync token past ordinary workload events from downtime before
+    // registering those handlers. Verification handlers are already installed
+    // so pending to-device and in-room verification requests are not discarded.
     let filter = FilterDefinition::with_lazy_loading();
     info!("Starting sync...");
     client
@@ -744,6 +789,19 @@ async fn main() -> Result<()> {
         );
         for room in invited {
             let room_id = room.room_id().to_owned();
+            let inviter = match room.invite_details().await {
+                Ok(details) => details.inviter_id,
+                Err(error) => {
+                    warn!("Could not determine inviter for pending invite {room_id}: {error}");
+                    room.leave().await.ok();
+                    continue;
+                }
+            };
+            if !state.allowed_inviters.is_empty() && !state.allowed_inviters.contains(&inviter) {
+                warn!("Rejecting pending invite from {inviter} to {room_id}");
+                room.leave().await.ok();
+                continue;
+            }
             let via: Vec<OwnedServerName> = room_id
                 .server_name()
                 .map(|s| vec![s.to_owned()])
@@ -818,33 +876,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    // To-device verification requests
+    // In-room messages: admin commands and translation. Verification requests
+    // are consumed by mxbot-common's transport-independent handlers.
     client.add_event_handler({
         let state = state.clone();
-        move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
-            let state = state.clone();
-            async move {
-                let Some(request) = client
-                    .encryption()
-                    .get_verification_request(&ev.sender, &ev.content.transaction_id)
-                    .await
-                else {
-                    warn!("to-device verification request object not found");
-                    return;
-                };
-                tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client,
-                    Arc::clone(&state.reset_allowed),
-                    request,
-                ));
-            }
-        }
-    });
-
-    // In-room messages: verification requests, admin commands, and translation
-    client.add_event_handler({
-        let state = state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
+        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
             let state = state.clone();
             async move {
                 info!(
@@ -854,19 +890,6 @@ async fn main() -> Result<()> {
                 );
 
                 if let MessageType::VerificationRequest(_) = &ev.content.msgtype {
-                    let Some(request) = client
-                        .encryption()
-                        .get_verification_request(&ev.sender, &ev.event_id)
-                        .await
-                    else {
-                        warn!("in-room verification request object not found");
-                        return;
-                    };
-                    tokio::spawn(mxbot_common::verify::handle_verification_request(
-                        client,
-                        Arc::clone(&state.reset_allowed),
-                        request,
-                    ));
                     return;
                 }
 
@@ -1660,6 +1683,42 @@ min_confidence = 0.7
         );
     }
 
+    #[test]
+    fn serde_verification_policy_parses_and_has_bounded_defaults() {
+        let security: SecurityConfig = toml::from_str(
+            r#"
+allowed_inviters = ["@inviter:example.org"]
+
+[verification]
+allowed_users = ["@alice:example.org"]
+flow_timeout_secs = 120
+grant_ttl_secs = 300
+max_concurrent = 4
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(security.verification.allowed_users, ["@alice:example.org"]);
+        assert_eq!(security.verification.flow_timeout_secs, 120);
+        assert_eq!(security.verification.grant_ttl_secs, 300);
+        assert_eq!(security.verification.max_concurrent, 4);
+
+        let defaults: SecurityConfig = toml::from_str("").unwrap();
+        assert_eq!(defaults.verification.flow_timeout_secs, 300);
+        assert_eq!(defaults.verification.grant_ttl_secs, 600);
+        assert_eq!(defaults.verification.max_concurrent, 8);
+    }
+
+    #[test]
+    fn verify_device_command_arguments_are_strict() {
+        let (user, device) = parse_verify_device_arguments("@alice:example.org DEVICE").unwrap();
+        assert_eq!(user.as_str(), "@alice:example.org");
+        assert_eq!(device.as_str(), "DEVICE");
+        assert!(parse_verify_device_arguments("@alice:example.org").is_err());
+        assert!(parse_verify_device_arguments("not-a-user DEVICE").is_err());
+        assert!(parse_verify_device_arguments("@alice:example.org DEVICE extra").is_err());
+    }
+
     // ── Exact serialized Matrix event JSON ────────────────────────────────────
     //
     // These tests serialize actual RoomMessageEventContent values and assert
@@ -2284,12 +2343,48 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
 
     let raw = text_content.body.trim();
 
+    // Admin command: initiate a to-device verification without requiring the
+    // target user to have permission to send room messages.
+    if let Some(arguments) = raw.strip_prefix("!verify-device ") {
+        if !state.admin_users.contains(&event.sender) {
+            warn!("!verify-device from non-admin {} — ignored", event.sender);
+            return;
+        }
+
+        let (target_user, target_device) = match parse_verify_device_arguments(arguments) {
+            Ok(target) => target,
+            Err(error) => {
+                warn!("!verify-device: {error}");
+                return;
+            }
+        };
+        state
+            .verification
+            .grant_device(target_user.clone(), target_device.clone())
+            .await;
+        match state
+            .verification
+            .request_device_verification(&target_user, &target_device)
+            .await
+        {
+            Ok(()) => info!(
+                "Started administrator-approved to-device verification for {} {}",
+                target_user, target_device
+            ),
+            Err(error) => warn!(
+                "Could not start to-device verification for {} {}: {}",
+                target_user, target_device, error
+            ),
+        }
+        return;
+    }
+
     // Admin command: !reset-trust @user:server
     if let Some(target) = raw.strip_prefix("!reset-trust ") {
         if state.admin_users.contains(&event.sender) {
             match target.trim().parse::<OwnedUserId>() {
                 Ok(target_user) => {
-                    state.reset_allowed.lock().await.insert(target_user.clone());
+                    state.verification.grant_user(target_user.clone()).await;
                     info!(
                         "Trust reset allowed for {} (by {})",
                         target_user, event.sender
