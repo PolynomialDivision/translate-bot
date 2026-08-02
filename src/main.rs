@@ -729,6 +729,10 @@ async fn main() -> Result<()> {
             ),
             grant_ttl: Duration::from_secs(config.security.verification.grant_ttl_secs.max(1)),
             max_concurrent: config.security.verification.max_concurrent.max(1),
+            allow_users_from_joined_rooms: config
+                .security
+                .verification
+                .allow_users_from_joined_rooms,
         },
     );
     verification.install_handlers();

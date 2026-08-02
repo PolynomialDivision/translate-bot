@@ -83,6 +83,8 @@ encryption_strategy = "identity_based"
 # Users allowed to complete a first verification with the bot. If omitted or
 # empty, allowed_inviters is used as a compatibility fallback.
 allowed_users = ["@you:matrix.org"]
+# Also allow first-time verification for users sharing a joined room with the bot.
+allow_users_from_joined_rooms = false
 # Verification uses SAS only. Each flow and administrative grant is bounded.
 flow_timeout_secs = 300
 grant_ttl_secs = 600
