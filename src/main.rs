@@ -419,7 +419,7 @@ impl BotState {
                     .partial_cmp(&b.confidence)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|r| (r.language, r.confidence))
+            .map(|r| (r.language, normalize_confidence(r.confidence)))
     }
 
     async fn translate(
@@ -499,6 +499,15 @@ where
 
 fn is_backend_busy_body(body: &str) -> bool {
     body.to_lowercase().contains("server busy")
+}
+
+/// LibreTranslate-compatible `/detect` endpoints (including ltengine) report
+/// confidence on a 0-100 scale, but `min_confidence` is documented and
+/// configured on a 0.0-1.0 scale. Without this conversion, `min_confidence`
+/// compares against the wrong scale and only ever rejects a confidence of
+/// exactly 0 — the threshold silently stops filtering anything.
+fn normalize_confidence(raw: f64) -> f64 {
+    (raw / 100.0).clamp(0.0, 1.0)
 }
 
 fn response_excerpt(body: &str) -> String {
@@ -615,7 +624,11 @@ where
     }
 }
 
-fn log_suppressed_translation(failure: &TranslationBatchFailure) {
+fn log_suppressed_translation(
+    failure: &TranslationBatchFailure,
+    room_id: &str,
+    event_id: &OwnedEventId,
+) {
     let failed = failure
         .failed_targets
         .iter()
@@ -632,7 +645,8 @@ fn log_suppressed_translation(failure: &TranslationBatchFailure) {
         .join("; ");
 
     warn!(
-        "Translation suppressed context={} source_lang={} failed_targets=[{}] suppressed={}",
+        "Translation suppressed for {event_id} in {room_id}: context={} source_lang={} \
+         failed_targets=[{}] suppressed={}",
         failure.context, failure.source, failed, failure.suppressed
     );
 }
@@ -888,7 +902,8 @@ async fn main() -> Result<()> {
             let state = state.clone();
             async move {
                 info!(
-                    "Received room message from {} in {}",
+                    "Received room message {} from {} in {}",
+                    ev.event_id,
                     ev.sender,
                     room.room_id()
                 );
@@ -897,7 +912,17 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                if ev.sender == state.bot_user_id || room.state() != RoomState::Joined {
+                if ev.sender == state.bot_user_id {
+                    return;
+                }
+
+                if room.state() != RoomState::Joined {
+                    warn!(
+                        "Ignoring {} in {}: room state is {:?}, not Joined",
+                        ev.event_id,
+                        room.room_id(),
+                        room.state()
+                    );
                     return;
                 }
 
@@ -1222,6 +1247,109 @@ mod tests {
         assert!(failure.suppressed);
         assert_eq!(failure.failed_targets[0].attempts, 3);
         assert_eq!(failure.failed_targets[0].error.class(), "backend_busy");
+    }
+
+    // ── normalize_confidence tests ────────────────────────────────────────────
+    //
+    // LibreTranslate-compatible /detect endpoints (including ltengine, confirmed
+    // by direct query: {"confidence":33,"language":"de"}) report confidence on a
+    // 0-100 scale. min_confidence is documented and configured on a 0.0-1.0
+    // scale. Without normalizing at the API boundary, `confidence < min_confidence`
+    // (e.g. 33.0 < 0.5) is true for essentially every non-zero detection, so the
+    // threshold never rejects a low-confidence, likely-wrong language guess.
+
+    #[test]
+    fn normalize_confidence_converts_percent_to_fraction() {
+        assert_eq!(normalize_confidence(33.0), 0.33);
+        assert_eq!(normalize_confidence(100.0), 1.0);
+        assert_eq!(normalize_confidence(0.0), 0.0);
+        assert_eq!(normalize_confidence(7.0), 0.07);
+    }
+
+    #[test]
+    fn normalize_confidence_clamps_out_of_range_values() {
+        // Defensive: never let a backend quirk produce an out-of-bounds fraction.
+        assert_eq!(normalize_confidence(150.0), 1.0);
+        assert_eq!(normalize_confidence(-5.0), 0.0);
+    }
+
+    #[test]
+    fn normalize_confidence_low_value_correctly_fails_default_threshold() {
+        // Reproduces the observed bug scenario: a short/ambiguous message
+        // misdetected with low real-world confidence must fail the default
+        // min_confidence=0.5 threshold once normalized — pre-fix, 7.0 (raw)
+        // would have incorrectly cleared a 0.5 threshold.
+        let default = TranslationConfig::default();
+        assert!(normalize_confidence(7.0) < default.min_confidence);
+    }
+
+    // ── resolve_translation_targets tests ─────────────────────────────────────
+
+    fn test_translation_config() -> EffectiveTranslationConfig {
+        EffectiveTranslationConfig {
+            langs: vec!["en".to_owned(), "de".to_owned(), "uk".to_owned()],
+            min_confidence: 0.5,
+            reply_to_original: true,
+            thread_replies: true,
+            silent_messages: false,
+        }
+    }
+
+    #[test]
+    fn resolve_translation_targets_below_confidence_is_skipped() {
+        let cfg = test_translation_config();
+        let result = resolve_translation_targets(
+            "message",
+            "!room:example.org",
+            &eid("$ev:example.org"),
+            "de",
+            0.07,
+            &cfg,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_translation_targets_language_not_configured_is_skipped() {
+        let cfg = test_translation_config();
+        let result = resolve_translation_targets(
+            "message",
+            "!room:example.org",
+            &eid("$ev:example.org"),
+            "id",
+            0.99,
+            &cfg,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_translation_targets_no_remaining_targets_is_skipped() {
+        let mut cfg = test_translation_config();
+        cfg.langs = vec!["de".to_owned()];
+        let result = resolve_translation_targets(
+            "message",
+            "!room:example.org",
+            &eid("$ev:example.org"),
+            "de",
+            0.99,
+            &cfg,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_translation_targets_returns_remaining_langs_on_success() {
+        let cfg = test_translation_config();
+        let result = resolve_translation_targets(
+            "message",
+            "!room:example.org",
+            &eid("$ev:example.org"),
+            "de",
+            0.99,
+            &cfg,
+        );
+        assert_eq!(result, Some(vec!["en".to_owned(), "uk".to_owned()]));
     }
 
     #[test]
@@ -2131,12 +2259,62 @@ async fn translate_html_target_with_retry(
     }
 }
 
+/// Decide whether a detected message should be translated and, if so, into
+/// which target languages. Every rejection path logs its specific reason —
+/// without this, a message skipped here leaves no trace in the logs, making
+/// it indistinguishable from a message that was never received at all.
+fn resolve_translation_targets(
+    context: &str,
+    room_id: &str,
+    event_id: &OwnedEventId,
+    lang: &str,
+    confidence: f64,
+    translation: &EffectiveTranslationConfig,
+) -> Option<Vec<String>> {
+    if confidence < translation.min_confidence {
+        info!(
+            "Skipping {context} {event_id} in {room_id}: detected lang={lang} confidence={confidence:.2} \
+             below min_confidence={:.2}",
+            translation.min_confidence
+        );
+        return None;
+    }
+
+    if !translation.langs.iter().any(|l| l == lang) {
+        info!(
+            "Skipping {context} {event_id} in {room_id}: detected lang={lang} not in configured \
+             langs={:?}",
+            translation.langs
+        );
+        return None;
+    }
+
+    let targets: Vec<String> = translation
+        .langs
+        .iter()
+        .filter(|t| t.as_str() != lang)
+        .cloned()
+        .collect();
+    if targets.is_empty() {
+        info!(
+            "Skipping {context} {event_id} in {room_id}: no target languages remain after excluding \
+             source lang={lang} (configured langs={:?})",
+            translation.langs
+        );
+        return None;
+    }
+
+    Some(targets)
+}
+
 async fn translate_all_targets(
     state: &BotState,
     input: TranslationInput<'_>,
     source: &str,
     target_langs: Vec<String>,
     context: &'static str,
+    room_id: &str,
+    event_id: &OwnedEventId,
 ) -> Result<Vec<TranslatedLine>, TranslationBatchFailure> {
     let policy = state.retry_policy();
     let attempts_by_target = Arc::new(Mutex::new(HashMap::new()));
@@ -2183,7 +2361,7 @@ async fn translate_all_targets(
     .await;
 
     if let Err(ref failure) = result {
-        log_suppressed_translation(failure);
+        log_suppressed_translation(failure, room_id, event_id);
     }
 
     result
@@ -2246,33 +2424,33 @@ async fn handle_image_caption(
 ) {
     let Some((lang, confidence)) = state.detect(&caption).await else {
         warn!(
-            "Language detection failed for image caption ({})",
+            "Language detection failed for image caption {} in {} ({})",
+            event.event_id,
+            room.room_id(),
             event.sender
         );
         return;
     };
 
     info!(
-        "image caption lang={lang} conf={confidence:.2} sender={} room={}",
+        "image caption {} lang={lang} conf={confidence:.2} sender={} room={}",
+        event.event_id,
         event.sender,
         room.room_id()
     );
 
     let translation = state.translation_for_room(room.room_id().as_str());
 
-    if confidence < translation.min_confidence || !translation.langs.contains(&lang) {
+    let Some(targets) = resolve_translation_targets(
+        "image_caption",
+        room.room_id().as_str(),
+        &event.event_id,
+        &lang,
+        confidence,
+        &translation,
+    ) else {
         return;
-    }
-
-    let targets: Vec<String> = translation
-        .langs
-        .iter()
-        .filter(|t| t.as_str() != lang)
-        .cloned()
-        .collect();
-    if targets.is_empty() {
-        return;
-    }
+    };
 
     let lines = match translate_all_targets(
         &state,
@@ -2280,6 +2458,8 @@ async fn handle_image_caption(
         &lang,
         targets,
         "image_caption",
+        room.room_id().as_str(),
+        &event.event_id,
     )
     .await
     {
@@ -2420,31 +2600,34 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
     }
 
     let Some((lang, confidence)) = state.detect(text).await else {
-        warn!("Language detection failed ({})", event.sender);
+        warn!(
+            "Language detection failed for {} in {} ({})",
+            event.event_id,
+            room.room_id(),
+            event.sender
+        );
         return;
     };
 
     info!(
-        "lang={lang} conf={confidence:.2} sender={} room={}",
+        "{} lang={lang} conf={confidence:.2} sender={} room={}",
+        event.event_id,
         event.sender,
         room.room_id()
     );
 
     let translation = state.translation_for_room(room.room_id().as_str());
 
-    if confidence < translation.min_confidence || !translation.langs.contains(&lang) {
+    let Some(targets) = resolve_translation_targets(
+        "message",
+        room.room_id().as_str(),
+        &event.event_id,
+        &lang,
+        confidence,
+        &translation,
+    ) else {
         return;
-    }
-
-    let targets: Vec<String> = translation
-        .langs
-        .iter()
-        .filter(|t| t.as_str() != lang)
-        .cloned()
-        .collect();
-    if targets.is_empty() {
-        return;
-    }
+    };
 
     let html_to_translate = match &text_content.formatted {
         Some(fb) if fb.format == MessageFormat::Html => Some(strip_mx_reply(&fb.body)),
@@ -2454,7 +2637,17 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         Some(html) => TranslationInput::Html { html, plain: text },
         None => TranslationInput::Text { plain: text },
     };
-    let lines = match translate_all_targets(&state, input, &lang, targets, "message").await {
+    let lines = match translate_all_targets(
+        &state,
+        input,
+        &lang,
+        targets,
+        "message",
+        room.room_id().as_str(),
+        &event.event_id,
+    )
+    .await
+    {
         Ok(lines) => lines,
         Err(_) => return,
     };
@@ -2549,25 +2742,25 @@ async fn handle_edit(
     }
 
     let Some((lang, confidence)) = state.detect(text).await else {
-        warn!("Language detection failed for edit of {original_event_id}");
+        warn!(
+            "Language detection failed for edit of {original_event_id} in {}",
+            room.room_id()
+        );
         return;
     };
 
     let translation = state.translation_for_room(room.room_id().as_str());
 
-    if confidence < translation.min_confidence || !translation.langs.contains(&lang) {
+    let Some(targets) = resolve_translation_targets(
+        "edit",
+        room.room_id().as_str(),
+        &original_event_id,
+        &lang,
+        confidence,
+        &translation,
+    ) else {
         return;
-    }
-
-    let targets: Vec<String> = translation
-        .langs
-        .iter()
-        .filter(|t| t.as_str() != lang)
-        .cloned()
-        .collect();
-    if targets.is_empty() {
-        return;
-    }
+    };
 
     let lines = match translate_all_targets(
         &state,
@@ -2575,6 +2768,8 @@ async fn handle_edit(
         &lang,
         targets,
         "edit",
+        room.room_id().as_str(),
+        &original_event_id,
     )
     .await
     {
