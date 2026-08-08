@@ -21,3 +21,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 futures-util = "0.3"
 pulldown-cmark = "0.12"
 mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
+# Already pulled in transitively via matrix-sdk's "sqlite" feature
+# (matrix-sdk-sqlite); declared directly so translate-bot can keep its own
+# sibling database in the same store/ directory, following the precedent
+# set by radar-bot's store/items.db alongside store/matrix_store/.
+rusqlite = "0.37"

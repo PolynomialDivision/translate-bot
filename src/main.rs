@@ -1,12 +1,14 @@
 #![allow(clippy::items_after_test_module)]
 
+mod db;
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     path::PathBuf,
     sync::{
-        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -15,6 +17,8 @@ use mxbot_common::{
     config::{MatrixConfig, SecurityConfig},
     verify::{VerificationService, VerificationSettings},
 };
+
+use db::{Db, DbEventOutcome};
 
 fn flag_for_lang(lang: &str) -> &'static str {
     match lang {
@@ -38,7 +42,7 @@ fn flag_for_lang(lang: &str) -> &'static str {
     }
 }
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::future::join_all;
 use matrix_sdk::{
     config::SyncSettings,
@@ -74,14 +78,6 @@ use tracing::{error, info, warn};
 const MAX_TRANSLATION_ABSOLUTE_CHARS: usize = 1_000;
 const MAX_TRANSLATION_EXPANSION_FACTOR: usize = 6;
 const MAX_TRANSLATION_EXPANSION_SLACK: usize = 80;
-
-/// Upper bound on input text (message body or caption) submitted to the
-/// translation backend. The backend is a single, GPU-constrained, largely
-/// CPU-bound LLM shared across all rooms via a small concurrency semaphore
-/// (`backend_concurrency`) — one very long message would otherwise hold a
-/// slot for a disproportionate amount of time and delay everyone else's
-/// translations. Ordinary chat messages are nowhere near this limit.
-const MAX_INPUT_CHARS: usize = 4_000;
 
 fn parse_verify_device_arguments(
     arguments: &str,
@@ -145,6 +141,15 @@ struct TranslationConfig {
     /// Overall deadline for translating one Matrix event into all targets.
     #[serde(default = "default_translation_overall_timeout_secs")]
     overall_timeout_secs: u64,
+    /// Maximum input length (message body or caption, in characters)
+    /// submitted to the translation backend. The backend is a single,
+    /// GPU-constrained, largely CPU-bound LLM shared across all rooms via a
+    /// small concurrency semaphore (`backend_concurrency`) — one very long
+    /// message would otherwise hold a slot for a disproportionate amount of
+    /// time and delay everyone else's translations. Ordinary chat messages
+    /// are nowhere near the default.
+    #[serde(default = "default_max_input_chars")]
+    max_input_chars: usize,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -197,6 +202,10 @@ fn default_translation_overall_timeout_secs() -> u64 {
     90
 }
 
+fn default_max_input_chars() -> usize {
+    4_000
+}
+
 impl Default for TranslationConfig {
     fn default() -> Self {
         Self {
@@ -210,6 +219,7 @@ impl Default for TranslationConfig {
             max_attempts: default_translation_max_attempts(),
             retry_initial_backoff_ms: default_translation_retry_initial_backoff_ms(),
             overall_timeout_secs: default_translation_overall_timeout_secs(),
+            max_input_chars: default_max_input_chars(),
         }
     }
 }
@@ -432,6 +442,29 @@ struct EventOutcome {
     at: SystemTime,
 }
 
+impl From<&EventOutcome> for DbEventOutcome {
+    fn from(o: &EventOutcome) -> Self {
+        DbEventOutcome {
+            event_id: o.event_id.to_string(),
+            room_id: o.room_id.clone(),
+            sender: o.sender.clone(),
+            msgtype: o.msgtype.clone(),
+            text_source: o.text_source.to_owned(),
+            decision: o.decision.to_owned(),
+            reason: o.reason.map(str::to_owned),
+            source_lang: o.source_lang.clone(),
+            targets: o.targets.clone(),
+            matrix_send: o.matrix_send.map(str::to_owned),
+            duration_ms: o.duration_ms.map(|d| d as i64),
+            at: o
+                .at
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        }
+    }
+}
+
 const EVENT_OUTCOME_HISTORY: usize = 300;
 
 /// Process-lifetime counters and recent-event history. Reset on restart —
@@ -449,10 +482,11 @@ struct Stats {
     sync_reconnects: AtomicU64,
     skipped: RwLock<HashMap<&'static str, u64>>,
     recent: RwLock<VecDeque<EventOutcome>>,
+    db: Db,
 }
 
 impl Stats {
-    fn new() -> Self {
+    fn new(db: Db) -> Self {
         Self {
             started_at: SystemTime::now(),
             events_seen: AtomicU64::new(0),
@@ -465,6 +499,7 @@ impl Stats {
             sync_reconnects: AtomicU64::new(0),
             skipped: RwLock::new(HashMap::new()),
             recent: RwLock::new(VecDeque::new()),
+            db,
         }
     }
 
@@ -474,22 +509,51 @@ impl Stats {
         }
     }
 
+    /// Pushes into the in-memory ring buffer (fast path for the current
+    /// process's lifetime) and, best-effort, persists the same outcome to
+    /// the DB in the background so `!translate debug` can still find recent
+    /// failures after a restart. The DB write is fire-and-forget — this is
+    /// diagnostics, not the correctness-critical dedup path (that's
+    /// `Db::record_translation`, which callers await directly).
     fn push_outcome(&self, outcome: EventOutcome) {
         if let Ok(mut recent) = self.recent.write() {
-            recent.push_back(outcome);
+            recent.push_back(outcome.clone());
             while recent.len() > EVENT_OUTCOME_HISTORY {
                 recent.pop_front();
             }
         }
+        let db = self.db.clone();
+        let db_outcome = DbEventOutcome::from(&outcome);
+        tokio::spawn(async move {
+            if let Err(e) = db.push_outcome(db_outcome).await {
+                warn!("Failed to persist event outcome to DB: {e}");
+            }
+        });
     }
 
-    fn find_outcome(&self, event_id: &str) -> Option<EventOutcome> {
+    fn find_outcome_in_memory(&self, event_id: &str) -> Option<EventOutcome> {
         let recent = self.recent.read().ok()?;
         recent
             .iter()
             .rev()
             .find(|o| o.event_id.as_str() == event_id)
             .cloned()
+    }
+
+    /// Checks the in-memory ring buffer first, then falls back to the DB —
+    /// covers both "recent in this process" and "from before the last
+    /// restart" lookups.
+    async fn find_outcome(&self, event_id: &str) -> Option<DbEventOutcome> {
+        if let Some(o) = self.find_outcome_in_memory(event_id) {
+            return Some(DbEventOutcome::from(&o));
+        }
+        match self.db.find_outcome(event_id).await {
+            Ok(found) => found,
+            Err(e) => {
+                warn!("DB lookup failed for !translate debug {event_id}: {e}");
+                None
+            }
+        }
     }
 
     fn skipped_snapshot(&self) -> Vec<(&'static str, u64)> {
@@ -515,14 +579,15 @@ struct BotState {
     allowed_inviters: HashSet<OwnedUserId>,
     verification: VerificationService,
     startup_time: SystemTime,
-    // Maps user's original event_id → bot's translation event_id.
-    // Used to edit the bot's translation when the user edits their message.
-    translation_map: Arc<RwLock<HashMap<OwnedEventId, OwnedEventId>>>,
     // Caps concurrent in-flight message handlers to bound task/connection growth.
     inflight: Arc<Semaphore>,
     // Caps requests to ltengine across detection and translation.
     lt_requests: Arc<Semaphore>,
     stats: Arc<Stats>,
+    // Durable dedup (original event_id -> bot's translation event_id) and
+    // best-effort event-outcome history — survives process restarts.
+    // See db.rs. Cheap to clone (Arc<Mutex<Connection>> internally).
+    db: Db,
 }
 
 impl BotState {
@@ -619,9 +684,16 @@ impl BotState {
                     TranslationErrorKind::BackendBusy,
                     response_excerpt(&body),
                 )),
+                // Unlike the error-status and backend-busy cases above, a
+                // 2xx response that fails to parse as {"translatedText":...}
+                // is exactly the shape most likely to contain the translated
+                // user content itself (truncated/malformed JSON, but the
+                // text is still in there) — log the parse error and size
+                // only, never the body, so translated content never reaches
+                // logs.
                 Err(e) => Err(TranslationError::new(
                     TranslationErrorKind::ResponseParse,
-                    format!("{e}; body={}", response_excerpt(&body)),
+                    format!("{e} (body_len={} bytes)", body.len()),
                 )),
             }
         };
@@ -885,6 +957,13 @@ async fn main() -> Result<()> {
 
     let store_path =
         PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
+    fs::create_dir_all(&store_path).await?;
+    // Sibling file next to matrix-sdk's own store (matrix-sdk-*.sqlite3) —
+    // same directory, same volume, distinct name, no shared schema. Holds
+    // durable dedup (translations) and best-effort event-outcome history,
+    // both of which need to survive process/container restarts.
+    let db = Db::open(&store_path.join("translate-bot.sqlite3"))
+        .context("Failed to open translate-bot database")?;
     let (client, user_id) = mxbot_common::session::build_and_restore(
         &config.matrix,
         &store_path,
@@ -976,10 +1055,10 @@ async fn main() -> Result<()> {
         admin_users,
         allowed_inviters,
         verification,
-        translation_map: Arc::new(RwLock::new(HashMap::new())),
         inflight: Arc::new(Semaphore::new(8)),
         lt_requests: Arc::new(Semaphore::new(backend_concurrency)),
-        stats: Arc::new(Stats::new()),
+        stats: Arc::new(Stats::new(db.clone())),
+        db,
     };
 
     // Probe ltengine reachability at startup so failures are visible in logs.
@@ -1223,15 +1302,19 @@ async fn main() -> Result<()> {
                 };
 
                 // Check whether we have a translation for this event.
-                let bot_event_id = match state.translation_map.read() {
-                    Ok(map) => map.get(&redacted_id).cloned(),
+                let bot_event_id = match state.db.lookup_translation(redacted_id.as_str()).await {
+                    Ok(id) => id,
                     Err(e) => {
-                        warn!("translation_map lock poisoned on redaction read: {e}");
+                        warn!("Failed to look up translation for redacted {redacted_id}: {e}");
                         return;
                     }
                 };
 
                 let Some(bot_event_id) = bot_event_id else {
+                    return;
+                };
+                let Ok(bot_event_id) = matrix_sdk::ruma::EventId::parse(&bot_event_id) else {
+                    warn!("Stored bot_event_id '{bot_event_id}' for {redacted_id} is not a valid event ID");
                     return;
                 };
 
@@ -1245,12 +1328,9 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                // Remove from map so we don't attempt a double-redact.
-                match state.translation_map.write() {
-                    Ok(mut map) => {
-                        map.remove(&redacted_id);
-                    }
-                    Err(e) => warn!("translation_map lock poisoned on redaction write: {e}"),
+                // Remove from DB so we don't attempt a double-redact.
+                if let Err(e) = state.db.remove_translation(redacted_id.as_str()).await {
+                    warn!("Failed to remove translation record for {redacted_id}: {e}");
                 }
             }
         }
@@ -1344,23 +1424,24 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_op = Arc::clone(&calls);
 
-        let stats = Stats::new();
-        let line = retry_translation_operation("en", &policy, attempts_by_target, &stats, move || {
-            let calls_for_op = Arc::clone(&calls_for_op);
-            async move {
-                let call = calls_for_op.fetch_add(1, Ordering::SeqCst);
-                if call == 0 {
-                    Err(TranslationError::new(
-                        TranslationErrorKind::BackendBusy,
-                        "Server busy, please try again later",
-                    ))
-                } else {
-                    Ok(test_line("en"))
+        let stats = Stats::new(Db::open_in_memory().unwrap());
+        let line =
+            retry_translation_operation("en", &policy, attempts_by_target, &stats, move || {
+                let calls_for_op = Arc::clone(&calls_for_op);
+                async move {
+                    let call = calls_for_op.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        Err(TranslationError::new(
+                            TranslationErrorKind::BackendBusy,
+                            "Server busy, please try again later",
+                        ))
+                    } else {
+                        Ok(test_line("en"))
+                    }
                 }
-            }
-        })
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
 
         assert_eq!(line.target, "en");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -1446,19 +1527,20 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_op = Arc::clone(&calls);
 
-        let stats = Stats::new();
-        let failure = retry_translation_operation("en", &policy, attempts_by_target, &stats, move || {
-            let calls_for_op = Arc::clone(&calls_for_op);
-            async move {
-                calls_for_op.fetch_add(1, Ordering::SeqCst);
-                Err::<TranslatedLine, _>(TranslationError::new(
-                    TranslationErrorKind::ResponseParse,
-                    "malformed success response",
-                ))
-            }
-        })
-        .await
-        .unwrap_err();
+        let stats = Stats::new(Db::open_in_memory().unwrap());
+        let failure =
+            retry_translation_operation("en", &policy, attempts_by_target, &stats, move || {
+                let calls_for_op = Arc::clone(&calls_for_op);
+                async move {
+                    calls_for_op.fetch_add(1, Ordering::SeqCst);
+                    Err::<TranslatedLine, _>(TranslationError::new(
+                        TranslationErrorKind::ResponseParse,
+                        "malformed success response",
+                    ))
+                }
+            })
+            .await
+            .unwrap_err();
 
         assert_eq!(failure.attempts, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1475,21 +1557,22 @@ mod tests {
         let calls_for_op = Arc::clone(&calls);
         let target = "en".to_owned();
 
-        let stats = Stats::new();
-        let retried = retry_translation_operation("en", &policy, attempts_by_target, &stats, move || {
-            let calls_for_op = Arc::clone(&calls_for_op);
-            async move {
-                let call = calls_for_op.fetch_add(1, Ordering::SeqCst);
-                if call == 0 {
-                    Err(TranslationError::new(
-                        TranslationErrorKind::Timeout,
-                        "timed out",
-                    ))
-                } else {
-                    Ok(test_line("en"))
+        let stats = Stats::new(Db::open_in_memory().unwrap());
+        let retried =
+            retry_translation_operation("en", &policy, attempts_by_target, &stats, move || {
+                let calls_for_op = Arc::clone(&calls_for_op);
+                async move {
+                    let call = calls_for_op.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        Err(TranslationError::new(
+                            TranslationErrorKind::Timeout,
+                            "timed out",
+                        ))
+                    } else {
+                        Ok(test_line("en"))
+                    }
                 }
-            }
-        });
+            });
         let futures: Vec<BoxFuture<'_, Result<TranslatedLine, TargetTranslationFailure>>> =
             vec![retried.boxed()];
         let targets = vec![target];
@@ -1889,10 +1972,8 @@ mod tests {
 
     #[test]
     fn media_caption_kind_image_with_real_caption() {
-        let mut content = ImageMessageEventContent::plain(
-            "Hat jemand Interesse an einer Couch?".into(),
-            mxc(),
-        );
+        let mut content =
+            ImageMessageEventContent::plain("Hat jemand Interesse an einer Couch?".into(), mxc());
         content.filename = Some("1000006546.jpg".into());
         let msgtype = MessageType::Image(content);
         assert_eq!(
@@ -1990,10 +2071,7 @@ mod tests {
         let msgtype = MessageType::Text(TextMessageEventContent::plain(
             "> Alice: original\n\nEdited reply",
         ));
-        assert_eq!(
-            extract_edit_text(&msgtype),
-            Some("Edited reply".to_owned())
-        );
+        assert_eq!(extract_edit_text(&msgtype), Some("Edited reply".to_owned()));
     }
 
     #[test]
@@ -2040,7 +2118,7 @@ mod tests {
 
     #[test]
     fn stats_record_skip_increments_reason_counter() {
-        let stats = Stats::new();
+        let stats = Stats::new(Db::open_in_memory().unwrap());
         stats.record_skip(SkipReason::BelowConfidence);
         stats.record_skip(SkipReason::BelowConfidence);
         stats.record_skip(SkipReason::Backlog);
@@ -2078,24 +2156,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stats_ring_buffer_evicts_oldest_beyond_capacity() {
-        let stats = Stats::new();
+    #[tokio::test]
+    async fn stats_ring_buffer_evicts_oldest_beyond_capacity() {
+        // Tests the in-memory fast path specifically (find_outcome_in_memory);
+        // push_outcome also fires a best-effort DB write, covered separately
+        // by db::tests.
+        let stats = Stats::new(Db::open_in_memory().unwrap());
         for i in 0..(EVENT_OUTCOME_HISTORY + 5) {
             stats.push_outcome(test_outcome(&format!("$ev{i}:example.org")));
         }
-        assert!(stats.find_outcome("$ev0:example.org").is_none());
-        assert!(stats.find_outcome("$ev4:example.org").is_none());
-        assert!(
-            stats
-                .find_outcome(&format!("$ev{}:example.org", EVENT_OUTCOME_HISTORY + 4))
-                .is_some()
-        );
+        assert!(stats.find_outcome_in_memory("$ev0:example.org").is_none());
+        assert!(stats.find_outcome_in_memory("$ev4:example.org").is_none());
+        assert!(stats
+            .find_outcome_in_memory(&format!("$ev{}:example.org", EVENT_OUTCOME_HISTORY + 4))
+            .is_some());
     }
 
-    #[test]
-    fn stats_find_outcome_returns_most_recent_match() {
-        let stats = Stats::new();
+    #[tokio::test]
+    async fn stats_find_outcome_returns_most_recent_match() {
+        let stats = Stats::new(Db::open_in_memory().unwrap());
         let mut first = test_outcome("$dup:example.org");
         first.decision = "skip";
         stats.push_outcome(first);
@@ -2103,7 +2182,7 @@ mod tests {
         second.decision = "translate";
         stats.push_outcome(second);
 
-        let found = stats.find_outcome("$dup:example.org").unwrap();
+        let found = stats.find_outcome_in_memory("$dup:example.org").unwrap();
         assert_eq!(found.decision, "translate");
     }
 
@@ -2227,6 +2306,7 @@ mod tests {
             max_attempts: 3,
             retry_initial_backoff_ms: 250,
             overall_timeout_secs: 90,
+            max_input_chars: 4_000,
         };
 
         let effective = effective_translation_config(&default, &rooms, "!room:example.org");
@@ -2762,10 +2842,16 @@ async fn translate_text_target_with_retry(
     attempts_by_target: Arc<Mutex<HashMap<String, usize>>>,
 ) -> Result<TranslatedLine, TargetTranslationFailure> {
     let policy = state.retry_policy();
-    retry_translation_operation(target, &policy, attempts_by_target, &state.stats, || async {
-        let translated = state.translate(plain, source, target, "text").await?;
-        build_text_line(target, plain, translated)
-    })
+    retry_translation_operation(
+        target,
+        &policy,
+        attempts_by_target,
+        &state.stats,
+        || async {
+            let translated = state.translate(plain, source, target, "text").await?;
+            build_text_line(target, plain, translated)
+        },
+    )
     .await
 }
 
@@ -2959,41 +3045,96 @@ fn make_relation(
 /// lost — silently, with no retry — even though the expensive part (getting
 /// the translation) had already succeeded. Uses the same generic backoff
 /// helper the rest of the mxbot fleet uses for its join-room retry loop.
+const MATRIX_SEND_MAX_ATTEMPTS: u32 = 4;
+const MATRIX_SEND_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+const MATRIX_SEND_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Classifies a Matrix send failure as retryable or permanent, and extracts
+/// any server-suggested retry delay (`M_LIMIT_EXCEEDED`'s `retry_after`).
+/// Mirrors `TranslationError::is_transient()`'s split for the backend: a
+/// clearly permanent error (forbidden, not-in-room, malformed request, ...)
+/// is not worth retrying for ~30s before failing anyway, and a 429 should
+/// wait exactly as long as the server asked rather than guessing.
+fn classify_send_error(error: &matrix_sdk::Error) -> (bool, Option<Duration>) {
+    let matrix_sdk::Error::Http(http_error) = error else {
+        // Non-HTTP errors (serialization, crypto/store errors, ...) aren't
+        // known to be transient — don't retry them.
+        return (false, None);
+    };
+    let Some(api_error) = http_error.as_client_api_error() else {
+        // No parseable Matrix error body (e.g. a raw connection/timeout
+        // error that never reached the server) — treat as transient.
+        return (true, None);
+    };
+    let retry_after = api_error.error_kind().and_then(|kind| match kind {
+        matrix_sdk::ruma::api::error::ErrorKind::LimitExceeded(data) => {
+            data.retry_after.as_ref().and_then(|r| match r {
+                matrix_sdk::ruma::api::error::RetryAfter::Delay(d) => Some(*d),
+                matrix_sdk::ruma::api::error::RetryAfter::DateTime(t) => {
+                    t.duration_since(SystemTime::now()).ok()
+                }
+            })
+        }
+        _ => None,
+    });
+    let status = api_error.status_code.as_u16();
+    (status == 429 || status >= 500, retry_after)
+}
+
+/// Sends a translation with a few retries on transient failure (brief
+/// homeserver hiccup, 429 rate limit, 5xx), mirroring the retry/backoff
+/// policy already used for the translation backend itself. Without this, a
+/// translation that succeeded but hit a transient send error was simply
+/// lost — silently, with no retry — even though the expensive part (getting
+/// the translation) had already succeeded. Bounded to
+/// `MATRIX_SEND_MAX_ATTEMPTS`: a homeserver outage delays in-flight sends,
+/// it does not queue an unbounded, ever-growing backlog of retries, since
+/// each call is one bounded loop awaited directly by its caller (itself
+/// already serialized behind the `inflight`/`lt_requests` semaphores).
 async fn send_with_retry(
     room: &Room,
     event_id: &OwnedEventId,
     content: RoomMessageEventContent,
 ) -> Result<OwnedEventId, matrix_sdk::Error> {
-    mxbot_common::retry::retry_with_backoff(
-        4,
-        2,
-        &format!("matrix send for {event_id}"),
-        || {
-            let room = room.clone();
-            let content = content.clone();
-            async move { room.send(content).await.map(|resp| resp.response.event_id) }
-        },
-    )
-    .await
-}
-
-/// Records that `original_event_id` was translated into `bot_event_id`, so a
-/// later edit or redaction of the original can find and update/remove the
-/// bot's translation. Must be called for every successful send — text
-/// messages and media captions alike — or that event's edits/redactions are
-/// silently ignored later.
-fn record_translation(state: &BotState, original_event_id: OwnedEventId, bot_event_id: OwnedEventId) {
-    match state.translation_map.write() {
-        Ok(mut map) => {
-            map.insert(original_event_id, bot_event_id);
-            if map.len() > 10_000 {
-                // Prevent unbounded growth — edit/redact tracking for very old
-                // messages is sacrificed before memory becomes a problem.
-                map.retain(|_, _| false);
-                warn!("translation_map cleared after exceeding 10 000 entries");
+    let mut backoff = MATRIX_SEND_INITIAL_BACKOFF;
+    for attempt in 1..=MATRIX_SEND_MAX_ATTEMPTS {
+        match room.send(content.clone()).await {
+            Ok(resp) => return Ok(resp.response.event_id),
+            Err(e) => {
+                let (retryable, retry_after) = classify_send_error(&e);
+                if !retryable || attempt == MATRIX_SEND_MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                let delay = retry_after.unwrap_or(backoff).min(MATRIX_SEND_MAX_BACKOFF);
+                warn!(
+                    "Matrix send for {event_id} failed transiently \
+                     attempt={attempt}/{MATRIX_SEND_MAX_ATTEMPTS}: {e} — retrying in {delay:?}"
+                );
+                sleep(delay).await;
+                backoff = backoff.saturating_mul(2).min(MATRIX_SEND_MAX_BACKOFF);
             }
         }
-        Err(e) => warn!("translation_map lock poisoned on write: {e}"),
+    }
+    unreachable!("loop above always returns on its final iteration")
+}
+
+/// Durably records that `original_event_id` was translated into
+/// `bot_event_id`, so a later edit or redaction — even after a restart —
+/// can find and update/remove the bot's translation. Awaited synchronously
+/// (not fire-and-forget): this is the correctness-critical dedup path, so
+/// the write must complete before the caller considers the event handled.
+async fn record_translation(
+    state: &BotState,
+    original_event_id: &OwnedEventId,
+    bot_event_id: &OwnedEventId,
+    room_id: &str,
+) {
+    if let Err(e) = state
+        .db
+        .record_translation(original_event_id.as_str(), bot_event_id.as_str(), room_id)
+        .await
+    {
+        warn!("Failed to persist translation for {original_event_id}: {e}");
     }
 }
 
@@ -3203,7 +3344,9 @@ async fn handle_media_caption(
         started.elapsed(),
     );
     match send_result {
-        Ok(bot_event_id) => record_translation(&state, event.event_id.clone(), bot_event_id),
+        Ok(bot_event_id) => {
+            record_translation(&state, &event.event_id, &bot_event_id, &room_id).await
+        }
         Err(e) => error!("Failed to send {kind} caption translation: {e}"),
     }
 }
@@ -3296,13 +3439,13 @@ fn translate_stats_report(state: &BotState) -> String {
     )
 }
 
-fn translate_debug_report(state: &BotState, arg: &str) -> String {
+async fn translate_debug_report(state: &BotState, arg: &str) -> String {
     if arg.is_empty() {
         return "Usage: !translate debug <event-id>".to_owned();
     }
-    match state.stats.find_outcome(arg) {
+    match state.stats.find_outcome(arg).await {
         Some(o) => {
-            let ago = o.at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+            let ago = (db::now_secs() - o.at).max(0);
             format!(
                 "event={} room={} sender={} msgtype={} text_source={} decision={} reason={} \
                  source={} targets={} matrix_send={} duration_ms={} ({ago}s ago)",
@@ -3312,10 +3455,10 @@ fn translate_debug_report(state: &BotState, arg: &str) -> String {
                 o.msgtype,
                 o.text_source,
                 o.decision,
-                o.reason.unwrap_or("-"),
+                o.reason.as_deref().unwrap_or("-"),
                 o.source_lang.as_deref().unwrap_or("-"),
                 o.targets.as_deref().unwrap_or("-"),
-                o.matrix_send.unwrap_or("-"),
+                o.matrix_send.as_deref().unwrap_or("-"),
                 o.duration_ms
                     .map(|d| d.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
@@ -3323,8 +3466,9 @@ fn translate_debug_report(state: &BotState, arg: &str) -> String {
         }
         None => format!(
             "No record for {arg} — either it wasn't processed by this pipeline, or it's \
-             older than the last {EVENT_OUTCOME_HISTORY} processed events (in-memory \
-             history, reset on restart)."
+             older than the retained history (in-memory: last {EVENT_OUTCOME_HISTORY} \
+             events this process has seen; DB: last {} events across restarts).",
+            db::EVENT_OUTCOMES_RETENTION
         ),
     }
 }
@@ -3345,12 +3489,11 @@ async fn translate_retry_command(state: &BotState, room: &Room, arg: &str) -> St
         Err(e) => return format!("'{arg}' is not a valid event ID: {e}"),
     };
 
-    if let Some(bot_event_id) = state
-        .translation_map
-        .read()
-        .ok()
-        .and_then(|m| m.get(&event_id).cloned())
-    {
+    let already_translated = match state.db.lookup_translation(event_id.as_str()).await {
+        Ok(found) => found,
+        Err(e) => return format!("Could not check existing translations for {event_id}: {e}"),
+    };
+    if let Some(bot_event_id) = already_translated {
         record_skip(
             state,
             &event_id,
@@ -3446,15 +3589,17 @@ async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoo
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
         match caption {
-            Some(caption) if caption.chars().count() > MAX_INPUT_CHARS => record_skip(
-                &state,
-                &event.event_id,
-                &room_id,
-                Some(&sender),
-                kind,
-                "caption",
-                SkipReason::InputTooLong,
-            ),
+            Some(caption) if caption.chars().count() > state.translation.max_input_chars => {
+                record_skip(
+                    &state,
+                    &event.event_id,
+                    &room_id,
+                    Some(&sender),
+                    kind,
+                    "caption",
+                    SkipReason::InputTooLong,
+                )
+            }
             Some(caption) => {
                 info!("Translating caption from m.{kind} event {}", event.event_id);
                 handle_media_caption(state, room, event, caption, kind).await;
@@ -3547,7 +3692,7 @@ async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoo
                             target_user, event.sender
                         );
                     }
-                        Err(_) => warn!("!reset-trust: invalid user ID '{}'", target.trim()),
+                    Err(_) => warn!("!reset-trust: invalid user ID '{}'", target.trim()),
                 }
             } else {
                 warn!("!reset-trust from non-admin {} — ignored", event.sender);
@@ -3570,13 +3715,16 @@ async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoo
             let reply = match subcommand {
                 "status" => translate_status_report(&state).await,
                 "stats" => translate_stats_report(&state),
-                "debug" => translate_debug_report(&state, arg),
+                "debug" => translate_debug_report(&state, arg).await,
                 "version" => translate_version_report(),
                 "retry" => translate_retry_command(&state, &room, arg).await,
                 _ => "Usage: !translate <status|stats|debug <event-id>|retry <event-id>|version>"
                     .to_owned(),
             };
-            if let Err(e) = room.send(RoomMessageEventContent::notice_plain(reply)).await {
+            if let Err(e) = room
+                .send(RoomMessageEventContent::notice_plain(reply))
+                .await
+            {
                 warn!("Failed to send !translate reply: {e}");
             }
             return;
@@ -3597,7 +3745,7 @@ async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoo
         );
         return;
     }
-    if text.chars().count() > MAX_INPUT_CHARS {
+    if text.chars().count() > state.translation.max_input_chars {
         record_skip(
             &state,
             &event.event_id,
@@ -3708,7 +3856,9 @@ async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoo
         started.elapsed(),
     );
     match send_result {
-        Ok(bot_event_id) => record_translation(&state, event.event_id.clone(), bot_event_id),
+        Ok(bot_event_id) => {
+            record_translation(&state, &event.event_id, &bot_event_id, &room_id).await
+        }
         Err(e) => error!("Failed to send translation: {e}"),
     }
 }
@@ -3761,13 +3911,18 @@ async fn handle_edit(
     let msgtype_label = new_content.msgtype.msgtype();
 
     // Look up whether we have a translation for this event.
-    let bot_event_id = match state.translation_map.read() {
-        Ok(map) => map.get(&original_event_id).cloned(),
+    let bot_event_id = match state
+        .db
+        .lookup_translation(original_event_id.as_str())
+        .await
+    {
+        Ok(id) => id,
         Err(e) => {
-            warn!("translation_map lock poisoned on read in handle_edit: {e}");
+            warn!("Failed to look up translation for edit of {original_event_id}: {e}");
             return;
         }
     };
+    let bot_event_id = bot_event_id.and_then(|id| matrix_sdk::ruma::EventId::parse(id).ok());
 
     let Some(bot_event_id) = bot_event_id else {
         info!("Edit for unknown event {original_event_id} — no cached translation, ignoring");
@@ -3800,10 +3955,11 @@ async fn handle_edit(
         );
         return;
     };
-    if text.chars().count() > MAX_INPUT_CHARS {
+    if text.chars().count() > state.translation.max_input_chars {
         info!(
-            "Skipping edit of {original_event_id}: input is {} chars, exceeds MAX_INPUT_CHARS={MAX_INPUT_CHARS}",
-            text.chars().count()
+            "Skipping edit of {original_event_id}: input is {} chars, exceeds max_input_chars={}",
+            text.chars().count(),
+            state.translation.max_input_chars
         );
         record_skip(
             &state,
@@ -3819,9 +3975,7 @@ async fn handle_edit(
     let text = text.as_str();
 
     let Some((lang, confidence)) = state.detect(text).await else {
-        warn!(
-            "Language detection failed for edit of {original_event_id} in {room_id}"
-        );
+        warn!("Language detection failed for edit of {original_event_id} in {room_id}");
         record_skip(
             &state,
             &original_event_id,

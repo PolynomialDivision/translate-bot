@@ -51,6 +51,11 @@ min_confidence = 0.5
 # max_attempts = 3
 # retry_initial_backoff_ms = 250
 # overall_timeout_secs = 90
+# Maximum input length (message body or caption, in characters) submitted to
+# the translation backend. Protects the shared backend_concurrency slots from
+# being monopolized by one very long message. Longer input is skipped with
+# reason=input_too_long instead of being sent to the backend.
+# max_input_chars = 4000
 
 # Optional per-room translation overrides. Keys are Matrix room IDs.
 # Any omitted field inherits from [translation].

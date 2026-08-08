@@ -3647,6 +3647,7 @@ dependencies = [
  "mxbot-common",
  "pulldown-cmark",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
