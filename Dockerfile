@@ -1,10 +1,22 @@
 # syntax=docker/dockerfile:1
 # ── Base: chef + build deps ───────────────────────────────────────────────────
-FROM rust:1.95-slim-bookworm AS chef
-RUN cargo install cargo-chef --locked
+FROM rust:1.97.1-slim-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
+# sccache (via openssl-sys) needs pkg-config/libssl-dev at its own build
+# time, so this must come after the apt-get above.
+RUN cargo install cargo-chef sccache --locked
+
+# sccache wraps rustc so identical compilation work (e.g. the matrix-sdk /
+# ruma / mxbot-common dependency graph shared by these bots) is reused from
+# one BuildKit cache mount instead of recompiled per project. Incremental
+# compilation writes its own per-crate cache that fights sccache's
+# object-level cache, so it's disabled here per sccache's own guidance.
+ENV RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/sccache \
+    SCCACHE_CACHE_SIZE=20G \
+    CARGO_INCREMENTAL=0
 WORKDIR /build
 
 # ── Planner: capture the full dependency graph ────────────────────────────────
@@ -20,12 +32,14 @@ COPY --from=planner /build/recipe.json recipe.json
 
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=shared-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=shared-sccache,target=/sccache \
     --mount=type=cache,id=translate-bot-target,target=/build/target \
     cargo chef cook --release --recipe-path recipe.json
 
 COPY . .
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=shared-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=shared-sccache,target=/sccache \
     --mount=type=cache,id=translate-bot-target,target=/build/target \
     cargo build --release && \
     cp target/release/translate-bot /translate-bot
