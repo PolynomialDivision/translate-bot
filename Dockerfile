@@ -2,7 +2,7 @@
 # ── Base: chef + build deps ───────────────────────────────────────────────────
 FROM rust:1.97.1-slim-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev libsqlite3-dev \
+    pkg-config libssl-dev libsqlite3-dev git \
     && rm -rf /var/lib/apt/lists/*
 # sccache (via openssl-sys) needs pkg-config/libssl-dev at its own build
 # time, so this must come after the apt-get above.

@@ -67,6 +67,12 @@ min_confidence = 0.5
 # Only these users can allow someone to re-verify after their first verification.
 # Administrators can also start a room-independent verification with:
 # !verify-device @user:server DEVICE_ID
+# Admins can also run diagnostics from any room the bot is in:
+#   !translate status          health, sync/backend status, config summary
+#   !translate stats           event/skip/error counters since startup
+#   !translate debug <eventID> what happened to a specific event (recent history only)
+#   !translate retry <eventID> re-run translation for an event that has none yet
+#   !translate version         crate version + git commit the running binary was built from
 admin_users = ["@you:matrix.org"]
 
 # Only these users may invite the bot to a room.

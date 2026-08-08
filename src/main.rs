@@ -1,11 +1,14 @@
 #![allow(clippy::items_after_test_module)]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     path::PathBuf,
-    sync::{Arc, RwLock},
-    time::{Duration, SystemTime},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
 };
 
 use mxbot_common::{
@@ -44,6 +47,7 @@ use matrix_sdk::{
         events::{
             relation::{InReplyTo, Replacement, Reply, Thread},
             room::{
+                encrypted::OriginalSyncRoomEncryptedEvent,
                 member::StrippedRoomMemberEvent,
                 message::{
                     MessageFormat, MessageType, NoticeMessageEventContent,
@@ -70,6 +74,14 @@ use tracing::{error, info, warn};
 const MAX_TRANSLATION_ABSOLUTE_CHARS: usize = 1_000;
 const MAX_TRANSLATION_EXPANSION_FACTOR: usize = 6;
 const MAX_TRANSLATION_EXPANSION_SLACK: usize = 80;
+
+/// Upper bound on input text (message body or caption) submitted to the
+/// translation backend. The backend is a single, GPU-constrained, largely
+/// CPU-bound LLM shared across all rooms via a small concurrency semaphore
+/// (`backend_concurrency`) — one very long message would otherwise hold a
+/// slot for a disproportionate amount of time and delay everyone else's
+/// translations. Ordinary chat messages are nowhere near this limit.
+const MAX_INPUT_CHARS: usize = 4_000;
 
 fn parse_verify_device_arguments(
     arguments: &str,
@@ -356,6 +368,141 @@ enum TranslationInput<'a> {
     Html { html: &'a str, plain: &'a str },
 }
 
+/// Why an event was not translated. The `&'static str` form is what actually
+/// appears in logs/stats/diagnostics — kept as an enum so call sites can't
+/// typo a reason string that then silently fails to aggregate correctly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkipReason {
+    Backlog,
+    RoomNotJoined,
+    UnsupportedMsgtype,
+    NoCaption,
+    EmptyText,
+    InputTooLong,
+    LangDetectFailed,
+    BelowConfidence,
+    LanguageNotConfigured,
+    NoRemainingTargets,
+    TranslationSuppressed,
+    DecryptFailed,
+    EditUnknownEvent,
+    EditNoTranslatableText,
+    AlreadyTranslated,
+}
+
+impl SkipReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::RoomNotJoined => "room_not_joined",
+            Self::UnsupportedMsgtype => "unsupported_msgtype",
+            Self::NoCaption => "no_caption",
+            Self::EmptyText => "empty_text",
+            Self::InputTooLong => "input_too_long",
+            Self::LangDetectFailed => "lang_detect_failed",
+            Self::BelowConfidence => "below_confidence",
+            Self::LanguageNotConfigured => "language_not_configured",
+            Self::NoRemainingTargets => "no_remaining_targets",
+            Self::TranslationSuppressed => "translation_suppressed",
+            Self::DecryptFailed => "decrypt_failed",
+            Self::EditUnknownEvent => "edit_unknown_event",
+            Self::EditNoTranslatableText => "edit_no_translatable_text",
+            Self::AlreadyTranslated => "already_translated",
+        }
+    }
+}
+
+/// A snapshot of what happened to one Matrix event, kept in a bounded
+/// ring buffer so `!translate debug <event-id>` can explain recent history
+/// without needing a persistent store. Not a substitute for logs — just an
+/// index into "what do I check first."
+#[derive(Clone)]
+struct EventOutcome {
+    event_id: OwnedEventId,
+    room_id: String,
+    sender: Option<String>,
+    msgtype: String,
+    text_source: &'static str,
+    decision: &'static str, // "translate" | "skip" | "error"
+    reason: Option<&'static str>,
+    source_lang: Option<String>,
+    targets: Option<String>,
+    matrix_send: Option<&'static str>, // "ok" | "failed"
+    duration_ms: Option<u128>,
+    at: SystemTime,
+}
+
+const EVENT_OUTCOME_HISTORY: usize = 300;
+
+/// Process-lifetime counters and recent-event history. Reset on restart —
+/// this is in-memory diagnostics for "what's happening right now", not a
+/// durable audit log (that's what stdout/docker logs are for).
+struct Stats {
+    started_at: SystemTime,
+    events_seen: AtomicU64,
+    translated: AtomicU64,
+    decrypt_failures: AtomicU64,
+    translation_api_failures: AtomicU64,
+    matrix_send_failures: AtomicU64,
+    retries: AtomicU64,
+    retries_succeeded: AtomicU64,
+    sync_reconnects: AtomicU64,
+    skipped: RwLock<HashMap<&'static str, u64>>,
+    recent: RwLock<VecDeque<EventOutcome>>,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            started_at: SystemTime::now(),
+            events_seen: AtomicU64::new(0),
+            translated: AtomicU64::new(0),
+            decrypt_failures: AtomicU64::new(0),
+            translation_api_failures: AtomicU64::new(0),
+            matrix_send_failures: AtomicU64::new(0),
+            retries: AtomicU64::new(0),
+            retries_succeeded: AtomicU64::new(0),
+            sync_reconnects: AtomicU64::new(0),
+            skipped: RwLock::new(HashMap::new()),
+            recent: RwLock::new(VecDeque::new()),
+        }
+    }
+
+    fn record_skip(&self, reason: SkipReason) {
+        if let Ok(mut map) = self.skipped.write() {
+            *map.entry(reason.as_str()).or_insert(0) += 1;
+        }
+    }
+
+    fn push_outcome(&self, outcome: EventOutcome) {
+        if let Ok(mut recent) = self.recent.write() {
+            recent.push_back(outcome);
+            while recent.len() > EVENT_OUTCOME_HISTORY {
+                recent.pop_front();
+            }
+        }
+    }
+
+    fn find_outcome(&self, event_id: &str) -> Option<EventOutcome> {
+        let recent = self.recent.read().ok()?;
+        recent
+            .iter()
+            .rev()
+            .find(|o| o.event_id.as_str() == event_id)
+            .cloned()
+    }
+
+    fn skipped_snapshot(&self) -> Vec<(&'static str, u64)> {
+        let mut v: Vec<_> = self
+            .skipped
+            .read()
+            .map(|map| map.iter().map(|(&k, &v)| (k, v)).collect())
+            .unwrap_or_default();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        v
+    }
+}
+
 #[derive(Clone)]
 struct BotState {
     lt_url: String,
@@ -375,6 +522,7 @@ struct BotState {
     inflight: Arc<Semaphore>,
     // Caps requests to ltengine across detection and translation.
     lt_requests: Arc<Semaphore>,
+    stats: Arc<Stats>,
 }
 
 impl BotState {
@@ -523,6 +671,7 @@ async fn retry_translation_operation<T, Op, Fut>(
     target: &str,
     policy: &TranslationRetryPolicy,
     attempts_by_target: Arc<Mutex<HashMap<String, usize>>>,
+    stats: &Stats,
     mut op: Op,
 ) -> Result<T, TargetTranslationFailure>
 where
@@ -540,7 +689,12 @@ where
             .insert(target.to_owned(), attempts);
 
         match op().await {
-            Ok(value) => return Ok(value),
+            Ok(value) => {
+                if attempts > 1 {
+                    stats.retries_succeeded.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(value);
+            }
             Err(error) if attempts < policy.max_attempts && error.is_transient() => {
                 warn!(
                     "Translation target={target} failed transiently attempt={attempts}/{} class={} detail={} — retrying",
@@ -548,6 +702,7 @@ where
                     error.class(),
                     error.detail
                 );
+                stats.retries.fetch_add(1, Ordering::Relaxed);
                 if !backoff.is_zero() {
                     sleep(backoff).await;
                     backoff = backoff.saturating_mul(2);
@@ -625,6 +780,7 @@ where
 }
 
 fn log_suppressed_translation(
+    state: &BotState,
     failure: &TranslationBatchFailure,
     room_id: &str,
     event_id: &OwnedEventId,
@@ -649,6 +805,43 @@ fn log_suppressed_translation(
          failed_targets=[{}] suppressed={}",
         failure.context, failure.source, failed, failure.suppressed
     );
+
+    state
+        .stats
+        .translation_api_failures
+        .fetch_add(failure.failed_targets.len() as u64, Ordering::Relaxed);
+    state.stats.record_skip(SkipReason::TranslationSuppressed);
+    state.stats.push_outcome(EventOutcome {
+        event_id: event_id.clone(),
+        room_id: room_id.to_owned(),
+        sender: None,
+        msgtype: failure.context.to_owned(),
+        text_source: failure.context,
+        decision: "error",
+        reason: Some(SkipReason::TranslationSuppressed.as_str()),
+        source_lang: Some(failure.source.clone()),
+        targets: Some(
+            failure
+                .failed_targets
+                .iter()
+                .map(|f| f.target.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        matrix_send: None,
+        duration_ms: None,
+        at: SystemTime::now(),
+    });
+    info!(
+        event = %event_id,
+        room = room_id,
+        msgtype = failure.context,
+        text_source = failure.context,
+        decision = "error",
+        reason = "translation_suppressed",
+        source = %failure.source,
+        "event processed"
+    );
 }
 
 fn build_translation_bodies(lines: &[TranslatedLine]) -> (String, String) {
@@ -666,7 +859,21 @@ fn build_translation_bodies(lines: &[TranslatedLine]) -> (String, String) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // matrix-sdk instruments its own sync/event-handler internals at INFO and
+    // captures large Debug-formatted fields (the entire SyncSettings /
+    // FilterDefinition) on every span — left unfiltered, that dwarfs our own
+    // logs and burns through the container's log rotation budget within
+    // hours, evicting the history needed to debug past events. RUST_LOG, if
+    // set, still overrides this entirely.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
+            |_| {
+                tracing_subscriber::EnvFilter::new(
+                    "info,matrix_sdk=warn,matrix_sdk_crypto=warn,matrix_sdk_base=warn,matrix_sdk_ui=warn",
+                )
+            },
+        ))
+        .init();
 
     let config_path = std::env::args()
         .nth(1)
@@ -772,6 +979,7 @@ async fn main() -> Result<()> {
         translation_map: Arc::new(RwLock::new(HashMap::new())),
         inflight: Arc::new(Semaphore::new(8)),
         lt_requests: Arc::new(Semaphore::new(backend_concurrency)),
+        stats: Arc::new(Stats::new()),
     };
 
     // Probe ltengine reachability at startup so failures are visible in logs.
@@ -928,12 +1136,23 @@ async fn main() -> Result<()> {
                     return;
                 }
 
+                state.stats.events_seen.fetch_add(1, Ordering::Relaxed);
+
                 if room.state() != RoomState::Joined {
                     warn!(
                         "Ignoring {} in {}: room state is {:?}, not Joined",
                         ev.event_id,
                         room.room_id(),
                         room.state()
+                    );
+                    record_skip(
+                        &state,
+                        &ev.event_id,
+                        room.room_id().as_str(),
+                        Some(ev.sender.as_str()),
+                        ev.content.msgtype.msgtype(),
+                        "n/a",
+                        SkipReason::RoomNotJoined,
                     );
                     return;
                 }
@@ -945,6 +1164,44 @@ async fn main() -> Result<()> {
                     let _permit = inflight.acquire_owned().await;
                     handle_message(state, room, ev).await;
                 });
+            }
+        }
+    });
+
+    // Events matrix-sdk-crypto could not decrypt stay shaped as m.room.encrypted
+    // and are dispatched here instead of to the OriginalSyncRoomMessageEvent
+    // handler above (which only ever sees plaintext — the SDK recasts an event
+    // to its plaintext type before dispatch, precisely when decryption
+    // succeeded). Without this handler, undecryptable events were completely
+    // invisible: no log, no counter, nothing. Known limitation: matrix-sdk can
+    // later re-decrypt an event once a key arrives (see its `redecryptor`),
+    // but that does not re-invoke event handlers, so a late key does not
+    // retroactively translate the message — the room key needs to already be
+    // available at sync time.
+    client.add_event_handler({
+        let state = state.clone();
+        move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
+            let state = state.clone();
+            async move {
+                if ev.sender == state.bot_user_id {
+                    return;
+                }
+                warn!(
+                    "Unable to decrypt {} from {} in {} — translation skipped",
+                    ev.event_id,
+                    ev.sender,
+                    room.room_id()
+                );
+                state.stats.decrypt_failures.fetch_add(1, Ordering::Relaxed);
+                record_skip(
+                    &state,
+                    &ev.event_id,
+                    room.room_id().as_str(),
+                    Some(ev.sender.as_str()),
+                    "m.room.encrypted",
+                    "n/a",
+                    SkipReason::DecryptFailed,
+                );
             }
         }
     });
@@ -1007,6 +1264,11 @@ async fn main() -> Result<()> {
             Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
             Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
         }
+        // client.sync() already retries transient network errors internally
+        // without returning; reaching here means it gave up entirely, so
+        // this is a coarse "how often did the whole sync loop have to
+        // restart" signal, not a per-request retry count.
+        state.stats.sync_reconnects.fetch_add(1, Ordering::Relaxed);
         sleep(Duration::from_secs(5)).await;
     }
 }
@@ -1082,7 +1344,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_op = Arc::clone(&calls);
 
-        let line = retry_translation_operation("en", &policy, attempts_by_target, move || {
+        let stats = Stats::new();
+        let line = retry_translation_operation("en", &policy, attempts_by_target, &stats, move || {
             let calls_for_op = Arc::clone(&calls_for_op);
             async move {
                 let call = calls_for_op.fetch_add(1, Ordering::SeqCst);
@@ -1101,6 +1364,8 @@ mod tests {
 
         assert_eq!(line.target, "en");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(stats.retries.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.retries_succeeded.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1181,7 +1446,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_op = Arc::clone(&calls);
 
-        let failure = retry_translation_operation("en", &policy, attempts_by_target, move || {
+        let stats = Stats::new();
+        let failure = retry_translation_operation("en", &policy, attempts_by_target, &stats, move || {
             let calls_for_op = Arc::clone(&calls_for_op);
             async move {
                 calls_for_op.fetch_add(1, Ordering::SeqCst);
@@ -1196,6 +1462,9 @@ mod tests {
 
         assert_eq!(failure.attempts, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Not transient — must not count as a retry attempt.
+        assert_eq!(stats.retries.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.retries_succeeded.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -1206,7 +1475,8 @@ mod tests {
         let calls_for_op = Arc::clone(&calls);
         let target = "en".to_owned();
 
-        let retried = retry_translation_operation("en", &policy, attempts_by_target, move || {
+        let stats = Stats::new();
+        let retried = retry_translation_operation("en", &policy, attempts_by_target, &stats, move || {
             let calls_for_op = Arc::clone(&calls_for_op);
             async move {
                 let call = calls_for_op.fetch_add(1, Ordering::SeqCst);
@@ -1318,7 +1588,7 @@ mod tests {
             0.07,
             &cfg,
         );
-        assert!(result.is_none());
+        assert_eq!(result, Err(SkipReason::BelowConfidence));
     }
 
     #[test]
@@ -1332,7 +1602,7 @@ mod tests {
             0.99,
             &cfg,
         );
-        assert!(result.is_none());
+        assert_eq!(result, Err(SkipReason::LanguageNotConfigured));
     }
 
     #[test]
@@ -1347,7 +1617,7 @@ mod tests {
             0.99,
             &cfg,
         );
-        assert!(result.is_none());
+        assert_eq!(result, Err(SkipReason::NoRemainingTargets));
     }
 
     #[test]
@@ -1361,7 +1631,7 @@ mod tests {
             0.99,
             &cfg,
         );
-        assert_eq!(result, Some(vec!["en".to_owned(), "uk".to_owned()]));
+        assert_eq!(result, Ok(vec!["en".to_owned(), "uk".to_owned()]));
     }
 
     #[test]
@@ -1544,31 +1814,19 @@ mod tests {
     fn blockquote_strip_preserves_mid_message_blockquotes() {
         // A message that starts normally but has a blockquote mid-text should be untouched
         let raw = "Here is my point:\n> some quote\nAnd my conclusion";
-        let text: String = if raw.starts_with("> ") {
-            raw.lines()
-                .skip_while(|l| l.starts_with("> "))
-                .skip_while(|l| l.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            raw.to_owned()
-        };
-        assert_eq!(text, raw);
+        assert_eq!(strip_reply_fallback(raw), raw);
     }
 
     #[test]
     fn blockquote_strip_passthrough_when_no_leading_quote() {
         let raw = "Normal message without quotes";
-        let text: String = if raw.starts_with("> ") {
-            raw.lines()
-                .skip_while(|l| l.starts_with("> "))
-                .skip_while(|l| l.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            raw.to_owned()
-        };
-        assert_eq!(text, raw);
+        assert_eq!(strip_reply_fallback(raw), raw);
+    }
+
+    #[test]
+    fn blockquote_strip_removes_leading_reply_fallback() {
+        let raw = "> Alice: original message\n\nActual reply text";
+        assert_eq!(strip_reply_fallback(raw), "Actual reply text");
     }
 
     #[test]
@@ -1603,8 +1861,8 @@ mod tests {
     use matrix_sdk::ruma::{
         events::room::{
             message::{
-                AudioMessageEventContent, FileMessageEventContent, ImageMessageEventContent,
-                LocationMessageEventContent, VideoMessageEventContent,
+                AudioMessageEventContent, EmoteMessageEventContent, FileMessageEventContent,
+                ImageMessageEventContent, LocationMessageEventContent, VideoMessageEventContent,
             },
             EncryptedFile, EncryptedFileHashes, EncryptedFileInfo, V2EncryptedFileInfo,
         },
@@ -1720,6 +1978,133 @@ mod tests {
             "geo:0,0".into(),
         ));
         assert_eq!(media_caption_kind(&msgtype), None);
+    }
+
+    // ── extract_edit_text tests ──────────────────────────────────────────────
+    // Edits of captioned media arrive with the same media msgtype as the
+    // original (not m.text) — these pin down that handle_edit can extract
+    // text from that shape too, not just m.text/m.emote.
+
+    #[test]
+    fn extract_edit_text_from_text_strips_reply_fallback() {
+        let msgtype = MessageType::Text(TextMessageEventContent::plain(
+            "> Alice: original\n\nEdited reply",
+        ));
+        assert_eq!(
+            extract_edit_text(&msgtype),
+            Some("Edited reply".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_edit_text_from_emote() {
+        let msgtype = MessageType::Emote(EmoteMessageEventContent::plain("waves hello"));
+        assert_eq!(extract_edit_text(&msgtype), Some("waves hello".to_owned()));
+    }
+
+    #[test]
+    fn extract_edit_text_from_edited_image_caption() {
+        let mut content = ImageMessageEventContent::plain("Edited caption".into(), mxc());
+        content.filename = Some("1000006546.jpg".into());
+        let msgtype = MessageType::Image(content);
+        assert_eq!(
+            extract_edit_text(&msgtype),
+            Some("Edited caption".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_edit_text_from_edited_filename_only_caption_is_none() {
+        let mut content = ImageMessageEventContent::plain("1000006546.jpg".into(), mxc());
+        content.filename = Some("1000006546.jpg".into());
+        let msgtype = MessageType::Image(content);
+        assert_eq!(extract_edit_text(&msgtype), None);
+    }
+
+    #[test]
+    fn extract_edit_text_from_unsupported_type_is_none() {
+        let msgtype = MessageType::Location(LocationMessageEventContent::new(
+            "shared a location".into(),
+            "geo:0,0".into(),
+        ));
+        assert_eq!(extract_edit_text(&msgtype), None);
+    }
+
+    #[test]
+    fn extract_edit_text_empty_after_strip_is_none() {
+        let msgtype = MessageType::Text(TextMessageEventContent::plain("   "));
+        assert_eq!(extract_edit_text(&msgtype), None);
+    }
+
+    // ── Stats tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn stats_record_skip_increments_reason_counter() {
+        let stats = Stats::new();
+        stats.record_skip(SkipReason::BelowConfidence);
+        stats.record_skip(SkipReason::BelowConfidence);
+        stats.record_skip(SkipReason::Backlog);
+        let snapshot = stats.skipped_snapshot();
+        assert_eq!(
+            snapshot
+                .iter()
+                .find(|(reason, _)| *reason == "below_confidence")
+                .map(|(_, count)| *count),
+            Some(2)
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .find(|(reason, _)| *reason == "backlog")
+                .map(|(_, count)| *count),
+            Some(1)
+        );
+    }
+
+    fn test_outcome(event_id: &str) -> EventOutcome {
+        EventOutcome {
+            event_id: eid(event_id),
+            room_id: "!room:example.org".to_owned(),
+            sender: None,
+            msgtype: "m.text".to_owned(),
+            text_source: "body",
+            decision: "skip",
+            reason: Some("below_confidence"),
+            source_lang: None,
+            targets: None,
+            matrix_send: None,
+            duration_ms: None,
+            at: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn stats_ring_buffer_evicts_oldest_beyond_capacity() {
+        let stats = Stats::new();
+        for i in 0..(EVENT_OUTCOME_HISTORY + 5) {
+            stats.push_outcome(test_outcome(&format!("$ev{i}:example.org")));
+        }
+        assert!(stats.find_outcome("$ev0:example.org").is_none());
+        assert!(stats.find_outcome("$ev4:example.org").is_none());
+        assert!(
+            stats
+                .find_outcome(&format!("$ev{}:example.org", EVENT_OUTCOME_HISTORY + 4))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stats_find_outcome_returns_most_recent_match() {
+        let stats = Stats::new();
+        let mut first = test_outcome("$dup:example.org");
+        first.decision = "skip";
+        stats.push_outcome(first);
+        let mut second = test_outcome("$dup:example.org");
+        second.decision = "translate";
+        stats.push_outcome(second);
+
+        let found = stats.find_outcome("$dup:example.org").unwrap();
+        assert_eq!(found.decision, "translate");
     }
 
     // ── make_relation tests ───────────────────────────────────────────────────
@@ -2303,6 +2688,22 @@ fn strip_mx_reply(html: &str) -> String {
     html.to_owned()
 }
 
+/// Strip the leading Matrix reply-fallback block from a plain-text body:
+/// consecutive "> " lines at the top, followed by a blank separator line.
+/// Only the top block is removed so intentional blockquotes later in the
+/// message are preserved.
+fn strip_reply_fallback(raw: &str) -> String {
+    if raw.starts_with("> ") {
+        raw.lines()
+            .skip_while(|l| l.starts_with("> "))
+            .skip_while(|l| l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        raw.to_owned()
+    }
+}
+
 fn build_text_line(
     target: &str,
     source_plain: &str,
@@ -2361,7 +2762,7 @@ async fn translate_text_target_with_retry(
     attempts_by_target: Arc<Mutex<HashMap<String, usize>>>,
 ) -> Result<TranslatedLine, TargetTranslationFailure> {
     let policy = state.retry_policy();
-    retry_translation_operation(target, &policy, attempts_by_target, || async {
+    retry_translation_operation(target, &policy, attempts_by_target, &state.stats, || async {
         let translated = state.translate(plain, source, target, "text").await?;
         build_text_line(target, plain, translated)
     })
@@ -2378,12 +2779,17 @@ async fn translate_html_target_with_retry(
 ) -> Result<TranslatedLine, TargetTranslationFailure> {
     let policy = state.retry_policy();
     let source_plain = html_to_plain(html);
-    let html_result =
-        retry_translation_operation(target, &policy, attempts_by_target.clone(), || async {
+    let html_result = retry_translation_operation(
+        target,
+        &policy,
+        attempts_by_target.clone(),
+        &state.stats,
+        || async {
             let translated_html = state.translate(html, source, target, "html").await?;
             build_html_line(target, &source_plain, translated_html)
-        })
-        .await;
+        },
+    )
+    .await;
 
     match html_result {
         Ok(line) => Ok(line),
@@ -2411,14 +2817,14 @@ fn resolve_translation_targets(
     lang: &str,
     confidence: f64,
     translation: &EffectiveTranslationConfig,
-) -> Option<Vec<String>> {
+) -> Result<Vec<String>, SkipReason> {
     if confidence < translation.min_confidence {
         info!(
             "Skipping {context} {event_id} in {room_id}: detected lang={lang} confidence={confidence:.2} \
              below min_confidence={:.2}",
             translation.min_confidence
         );
-        return None;
+        return Err(SkipReason::BelowConfidence);
     }
 
     if !translation.langs.iter().any(|l| l == lang) {
@@ -2427,7 +2833,7 @@ fn resolve_translation_targets(
              langs={:?}",
             translation.langs
         );
-        return None;
+        return Err(SkipReason::LanguageNotConfigured);
     }
 
     let targets: Vec<String> = translation
@@ -2442,10 +2848,10 @@ fn resolve_translation_targets(
              source lang={lang} (configured langs={:?})",
             translation.langs
         );
-        return None;
+        return Err(SkipReason::NoRemainingTargets);
     }
 
-    Some(targets)
+    Ok(targets)
 }
 
 async fn translate_all_targets(
@@ -2502,7 +2908,7 @@ async fn translate_all_targets(
     .await;
 
     if let Err(ref failure) = result {
-        log_suppressed_translation(failure, room_id, event_id);
+        log_suppressed_translation(state, failure, room_id, event_id);
     }
 
     result
@@ -2546,6 +2952,145 @@ fn make_relation(
     }
 }
 
+/// Sends a translation with a few retries on transient failure (brief
+/// homeserver hiccup, 429 rate limit, ...), mirroring the retry/backoff
+/// policy already used for the translation backend itself. Without this, a
+/// translation that succeeded but hit a transient send error was simply
+/// lost — silently, with no retry — even though the expensive part (getting
+/// the translation) had already succeeded. Uses the same generic backoff
+/// helper the rest of the mxbot fleet uses for its join-room retry loop.
+async fn send_with_retry(
+    room: &Room,
+    event_id: &OwnedEventId,
+    content: RoomMessageEventContent,
+) -> Result<OwnedEventId, matrix_sdk::Error> {
+    mxbot_common::retry::retry_with_backoff(
+        4,
+        2,
+        &format!("matrix send for {event_id}"),
+        || {
+            let room = room.clone();
+            let content = content.clone();
+            async move { room.send(content).await.map(|resp| resp.response.event_id) }
+        },
+    )
+    .await
+}
+
+/// Records that `original_event_id` was translated into `bot_event_id`, so a
+/// later edit or redaction of the original can find and update/remove the
+/// bot's translation. Must be called for every successful send — text
+/// messages and media captions alike — or that event's edits/redactions are
+/// silently ignored later.
+fn record_translation(state: &BotState, original_event_id: OwnedEventId, bot_event_id: OwnedEventId) {
+    match state.translation_map.write() {
+        Ok(mut map) => {
+            map.insert(original_event_id, bot_event_id);
+            if map.len() > 10_000 {
+                // Prevent unbounded growth — edit/redact tracking for very old
+                // messages is sacrificed before memory becomes a problem.
+                map.retain(|_, _| false);
+                warn!("translation_map cleared after exceeding 10 000 entries");
+            }
+        }
+        Err(e) => warn!("translation_map lock poisoned on write: {e}"),
+    }
+}
+
+/// Structured "event skipped" log line plus stats/ring-buffer bookkeeping.
+/// The single place that decides what a skip decision looks like, so every
+/// skip path in the pipeline stays consistent instead of drifting into its
+/// own ad-hoc log format.
+fn record_skip(
+    state: &BotState,
+    event_id: &OwnedEventId,
+    room_id: &str,
+    sender: Option<&str>,
+    msgtype: &str,
+    text_source: &'static str,
+    reason: SkipReason,
+) {
+    state.stats.record_skip(reason);
+    state.stats.push_outcome(EventOutcome {
+        event_id: event_id.clone(),
+        room_id: room_id.to_owned(),
+        sender: sender.map(str::to_owned),
+        msgtype: msgtype.to_owned(),
+        text_source,
+        decision: "skip",
+        reason: Some(reason.as_str()),
+        source_lang: None,
+        targets: None,
+        matrix_send: None,
+        duration_ms: None,
+        at: SystemTime::now(),
+    });
+    info!(
+        event = %event_id,
+        room = room_id,
+        sender = sender.unwrap_or("-"),
+        msgtype = msgtype,
+        text_source = text_source,
+        decision = "skip",
+        reason = reason.as_str(),
+        "event skipped"
+    );
+}
+
+/// Structured "event processed" log line plus stats/ring-buffer bookkeeping
+/// for a completed translate-and-send attempt (`matrix_send_ok` distinguishes
+/// a translation that was produced but failed to deliver).
+#[allow(clippy::too_many_arguments)]
+fn record_translated(
+    state: &BotState,
+    event_id: &OwnedEventId,
+    room_id: &str,
+    sender: &str,
+    msgtype: &str,
+    text_source: &'static str,
+    source_lang: &str,
+    targets: &[String],
+    matrix_send_ok: bool,
+    duration: Duration,
+) {
+    state.stats.translated.fetch_add(1, Ordering::Relaxed);
+    let matrix_send = if matrix_send_ok { "ok" } else { "failed" };
+    if !matrix_send_ok {
+        state
+            .stats
+            .matrix_send_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    let targets_joined = targets.join(",");
+    state.stats.push_outcome(EventOutcome {
+        event_id: event_id.clone(),
+        room_id: room_id.to_owned(),
+        sender: Some(sender.to_owned()),
+        msgtype: msgtype.to_owned(),
+        text_source,
+        decision: "translate",
+        reason: None,
+        source_lang: Some(source_lang.to_owned()),
+        targets: Some(targets_joined.clone()),
+        matrix_send: Some(matrix_send),
+        duration_ms: Some(duration.as_millis()),
+        at: SystemTime::now(),
+    });
+    info!(
+        event = %event_id,
+        room = room_id,
+        sender = sender,
+        msgtype = msgtype,
+        text_source = text_source,
+        decision = "translate",
+        source = source_lang,
+        targets = %targets_joined,
+        matrix_send = matrix_send,
+        duration_ms = duration.as_millis() as u64,
+        "event processed"
+    );
+}
+
 /// Build a translated message content with the right msgtype.
 /// `silent = true` → `m.notice` (suppressed push, muted styling in most clients).
 /// `silent = false` → `m.text` (default behaviour).
@@ -2567,43 +3112,64 @@ async fn handle_media_caption(
     caption: String,
     kind: &'static str,
 ) {
+    let started = Instant::now();
+    let room_id = room.room_id().as_str().to_owned();
+    let sender = event.sender.as_str().to_owned();
+
     let Some((lang, confidence)) = state.detect(&caption).await else {
         warn!(
             "Language detection failed for {kind} caption {} in {} ({})",
-            event.event_id,
-            room.room_id(),
-            event.sender
+            event.event_id, room_id, event.sender
+        );
+        record_skip(
+            &state,
+            &event.event_id,
+            &room_id,
+            Some(&sender),
+            kind,
+            "caption",
+            SkipReason::LangDetectFailed,
         );
         return;
     };
 
     info!(
         "{kind} caption {} lang={lang} conf={confidence:.2} sender={} room={}",
-        event.event_id,
-        event.sender,
-        room.room_id()
+        event.event_id, event.sender, room_id
     );
 
-    let translation = state.translation_for_room(room.room_id().as_str());
+    let translation = state.translation_for_room(&room_id);
 
-    let Some(targets) = resolve_translation_targets(
+    let targets = match resolve_translation_targets(
         kind,
-        room.room_id().as_str(),
+        &room_id,
         &event.event_id,
         &lang,
         confidence,
         &translation,
-    ) else {
-        return;
+    ) {
+        Ok(targets) => targets,
+        Err(reason) => {
+            record_skip(
+                &state,
+                &event.event_id,
+                &room_id,
+                Some(&sender),
+                kind,
+                "caption",
+                reason,
+            );
+            return;
+        }
     };
 
     let lines = match translate_all_targets(
         &state,
         TranslationInput::Text { plain: &caption },
         &lang,
-        targets,
+        targets.clone(),
         kind,
-        room.room_id().as_str(),
+        &room_id,
         &event.event_id,
     )
     .await
@@ -2623,8 +3189,22 @@ async fn handle_media_caption(
         in_thread,
     );
 
-    if let Err(e) = room.send(content).await {
-        error!("Failed to send {kind} caption translation: {e}");
+    let send_result = send_with_retry(&room, &event.event_id, content).await;
+    record_translated(
+        &state,
+        &event.event_id,
+        &room_id,
+        &sender,
+        kind,
+        "caption",
+        &lang,
+        &targets,
+        send_result.is_ok(),
+        started.elapsed(),
+    );
+    match send_result {
+        Ok(bot_event_id) => record_translation(&state, event.event_id.clone(), bot_event_id),
+        Err(e) => error!("Failed to send {kind} caption translation: {e}"),
     }
 }
 
@@ -2644,21 +3224,207 @@ fn media_caption_kind(msgtype: &MessageType) -> Option<(&'static str, Option<&st
     }
 }
 
+fn translate_version_report() -> String {
+    format!(
+        "translate-bot v{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("GIT_HASH")
+    )
+}
+
+async fn translate_status_report(state: &BotState) -> String {
+    let ltengine = match state
+        .http
+        .get(format!("{}/languages", state.lt_url))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => "reachable".to_owned(),
+        Ok(resp) => format!("HTTP {}", resp.status()),
+        Err(e) => format!("unreachable: {e}"),
+    };
+    let uptime = state
+        .stats
+        .started_at
+        .elapsed()
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let t = &state.translation;
+    format!(
+        "{} uptime={uptime}s ltengine={ltengine} sync_reconnects={}\n\
+         langs={:?} min_confidence={:.2} backend_concurrency={} \
+         request_timeout_secs={} overall_timeout_secs={} max_attempts={}\n\
+         events_seen={} translated={} decrypt_failures={} matrix_send_failures={}",
+        translate_version_report(),
+        state.stats.sync_reconnects.load(Ordering::Relaxed),
+        t.langs,
+        t.min_confidence,
+        t.backend_concurrency,
+        t.request_timeout_secs,
+        t.overall_timeout_secs,
+        t.max_attempts,
+        state.stats.events_seen.load(Ordering::Relaxed),
+        state.stats.translated.load(Ordering::Relaxed),
+        state.stats.decrypt_failures.load(Ordering::Relaxed),
+        state.stats.matrix_send_failures.load(Ordering::Relaxed),
+    )
+}
+
+fn translate_stats_report(state: &BotState) -> String {
+    let s = &state.stats;
+    let skipped = s.skipped_snapshot();
+    let skipped_str = if skipped.is_empty() {
+        "none".to_owned()
+    } else {
+        skipped
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "events_seen={} translated={} decrypt_failures={} translation_api_failures={} \
+         matrix_send_failures={} retries={} retries_succeeded={}\nskipped: {skipped_str}",
+        s.events_seen.load(Ordering::Relaxed),
+        s.translated.load(Ordering::Relaxed),
+        s.decrypt_failures.load(Ordering::Relaxed),
+        s.translation_api_failures.load(Ordering::Relaxed),
+        s.matrix_send_failures.load(Ordering::Relaxed),
+        s.retries.load(Ordering::Relaxed),
+        s.retries_succeeded.load(Ordering::Relaxed),
+    )
+}
+
+fn translate_debug_report(state: &BotState, arg: &str) -> String {
+    if arg.is_empty() {
+        return "Usage: !translate debug <event-id>".to_owned();
+    }
+    match state.stats.find_outcome(arg) {
+        Some(o) => {
+            let ago = o.at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+            format!(
+                "event={} room={} sender={} msgtype={} text_source={} decision={} reason={} \
+                 source={} targets={} matrix_send={} duration_ms={} ({ago}s ago)",
+                o.event_id,
+                o.room_id,
+                o.sender.as_deref().unwrap_or("-"),
+                o.msgtype,
+                o.text_source,
+                o.decision,
+                o.reason.unwrap_or("-"),
+                o.source_lang.as_deref().unwrap_or("-"),
+                o.targets.as_deref().unwrap_or("-"),
+                o.matrix_send.unwrap_or("-"),
+                o.duration_ms
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+            )
+        }
+        None => format!(
+            "No record for {arg} — either it wasn't processed by this pipeline, or it's \
+             older than the last {EVENT_OUTCOME_HISTORY} processed events (in-memory \
+             history, reset on restart)."
+        ),
+    }
+}
+
+/// Re-processes a specific event through the normal translate-and-send
+/// pipeline. Refuses if `translation_map` already has an entry for it (the
+/// invariant this exists to serve: retrying must never create a duplicate
+/// translation — if one already exists, editing the original message is the
+/// correct way to update it). Also picks up events that couldn't be
+/// decrypted at sync time but can be decrypted now, since `Room::event`
+/// re-attempts decryption with whatever keys are currently available.
+async fn translate_retry_command(state: &BotState, room: &Room, arg: &str) -> String {
+    if arg.is_empty() {
+        return "Usage: !translate retry <event-id>".to_owned();
+    }
+    let event_id = match matrix_sdk::ruma::EventId::parse(arg) {
+        Ok(id) => id,
+        Err(e) => return format!("'{arg}' is not a valid event ID: {e}"),
+    };
+
+    if let Some(bot_event_id) = state
+        .translation_map
+        .read()
+        .ok()
+        .and_then(|m| m.get(&event_id).cloned())
+    {
+        record_skip(
+            state,
+            &event_id,
+            room.room_id().as_str(),
+            None,
+            "n/a",
+            "n/a",
+            SkipReason::AlreadyTranslated,
+        );
+        return format!(
+            "{event_id} was already translated as {bot_event_id} — edit the original \
+             message if you want to force a re-translation."
+        );
+    }
+
+    let timeline_event = match room.event(&event_id, None).await {
+        Ok(ev) => ev,
+        Err(e) => return format!("Could not fetch {event_id}: {e}"),
+    };
+    if timeline_event.kind.is_utd() {
+        return format!("{event_id} is still not decryptable — no key available for it.");
+    }
+    let parsed: OriginalSyncRoomMessageEvent = match timeline_event
+        .kind
+        .raw()
+        .cast_ref_unchecked::<OriginalSyncRoomMessageEvent>()
+        .deserialize()
+    {
+        Ok(ev) => ev,
+        Err(e) => return format!("{event_id} is not a room message: {e}"),
+    };
+
+    // Boxed: handle_message_core can (transitively, via !translate retry)
+    // call back into itself, and an async fn can't recurse without indirection.
+    Box::pin(handle_message_core(state.clone(), room.clone(), parsed)).await;
+    format!("Retried {event_id} — run `!translate debug {event_id}` for the outcome.")
+}
+
 async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMessageEvent) {
     // Belt-and-suspenders: skip any event that predates the cutoff captured
     // just before handlers were registered (see `main`). The primary defence
     // is sync_once running before handlers are registered at all, which
     // prevents backlog events from reaching this function in the first
     // place; this check only catches whatever slips through that.
+    //
+    // This check lives here rather than in handle_message_core so that
+    // `!translate retry` — which necessarily reprocesses an old event — can
+    // call handle_message_core directly and bypass it.
     if let Some(event_time) = event.origin_server_ts.to_system_time() {
         if event_time < state.startup_time {
             info!(
                 "Skipping backlog message {} from {} (pre-startup)",
                 event.event_id, event.sender
             );
+            record_skip(
+                &state,
+                &event.event_id,
+                room.room_id().as_str(),
+                Some(event.sender.as_str()),
+                event.content.msgtype.msgtype(),
+                "n/a",
+                SkipReason::Backlog,
+            );
             return;
         }
     }
+
+    handle_message_core(state, room, event).await;
+}
+
+async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoomMessageEvent) {
+    let started = Instant::now();
+    let room_id = room.room_id().as_str().to_owned();
+    let sender = event.sender.as_str().to_owned();
 
     // Edits arrive as m.replace — route them to handle_edit and stop.
     // Must be checked BEFORE the msgtype guard: the top-level body of an edit
@@ -2680,132 +3446,218 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
         match caption {
+            Some(caption) if caption.chars().count() > MAX_INPUT_CHARS => record_skip(
+                &state,
+                &event.event_id,
+                &room_id,
+                Some(&sender),
+                kind,
+                "caption",
+                SkipReason::InputTooLong,
+            ),
             Some(caption) => {
                 info!("Translating caption from m.{kind} event {}", event.event_id);
                 handle_media_caption(state, room, event, caption, kind).await;
             }
-            None => info!(
-                "Skipping event {}: m.{kind} has no translatable caption",
-                event.event_id
+            None => record_skip(
+                &state,
+                &event.event_id,
+                &room_id,
+                Some(&sender),
+                kind,
+                "caption",
+                SkipReason::NoCaption,
             ),
         }
         return;
     }
 
-    let MessageType::Text(text_content) = &event.content.msgtype else {
-        info!(
-            "Skipping event {}: msgtype {} is not translatable",
-            event.event_id,
-            event.content.msgtype.msgtype()
-        );
-        return;
+    // m.text and m.emote carry the same body/formatted shape and are both
+    // genuine user-written text; other msgtypes (m.notice, m.location, ...)
+    // are not translated. m.notice in particular is left alone deliberately:
+    // it's the shape bots/servers use for their own chatter (including this
+    // bot's own translations), so translating it risks feedback loops with
+    // other notice-emitting bots in shared rooms.
+    let (raw, formatted) = match &event.content.msgtype {
+        MessageType::Text(t) => (t.body.as_str(), t.formatted.as_ref()),
+        MessageType::Emote(e) => (e.body.as_str(), e.formatted.as_ref()),
+        other => {
+            record_skip(
+                &state,
+                &event.event_id,
+                &room_id,
+                Some(&sender),
+                other.msgtype(),
+                "body",
+                SkipReason::UnsupportedMsgtype,
+            );
+            return;
+        }
     };
+    let msgtype_label = event.content.msgtype.msgtype();
+    let is_command_eligible = matches!(event.content.msgtype, MessageType::Text(_));
+    let raw = raw.trim();
 
-    let raw = text_content.body.trim();
+    // Admin commands only apply to genuine m.text — not m.emote.
+    if is_command_eligible {
+        // Admin command: initiate a to-device verification without requiring the
+        // target user to have permission to send room messages.
+        if let Some(arguments) = raw.strip_prefix("!verify-device ") {
+            if !state.admin_users.contains(&event.sender) {
+                warn!("!verify-device from non-admin {} — ignored", event.sender);
+                return;
+            }
 
-    // Admin command: initiate a to-device verification without requiring the
-    // target user to have permission to send room messages.
-    if let Some(arguments) = raw.strip_prefix("!verify-device ") {
-        if !state.admin_users.contains(&event.sender) {
-            warn!("!verify-device from non-admin {} — ignored", event.sender);
+            let (target_user, target_device) = match parse_verify_device_arguments(arguments) {
+                Ok(target) => target,
+                Err(error) => {
+                    warn!("!verify-device: {error}");
+                    return;
+                }
+            };
+            state
+                .verification
+                .grant_device(target_user.clone(), target_device.clone())
+                .await;
+            match state
+                .verification
+                .request_device_verification(&target_user, &target_device)
+                .await
+            {
+                Ok(()) => info!(
+                    "Started administrator-approved to-device verification for {} {}",
+                    target_user, target_device
+                ),
+                Err(error) => warn!(
+                    "Could not start to-device verification for {} {}: {}",
+                    target_user, target_device, error
+                ),
+            }
             return;
         }
 
-        let (target_user, target_device) = match parse_verify_device_arguments(arguments) {
-            Ok(target) => target,
-            Err(error) => {
-                warn!("!verify-device: {error}");
+        // Admin command: !reset-trust @user:server
+        if let Some(target) = raw.strip_prefix("!reset-trust ") {
+            if state.admin_users.contains(&event.sender) {
+                match target.trim().parse::<OwnedUserId>() {
+                    Ok(target_user) => {
+                        state.verification.grant_user(target_user.clone()).await;
+                        info!(
+                            "Trust reset allowed for {} (by {})",
+                            target_user, event.sender
+                        );
+                    }
+                        Err(_) => warn!("!reset-trust: invalid user ID '{}'", target.trim()),
+                }
+            } else {
+                warn!("!reset-trust from non-admin {} — ignored", event.sender);
+            }
+            return;
+        }
+
+        // Admin command family: !translate status | stats | debug <event-id>
+        // | retry <event-id> | version
+        if raw == "!translate" || raw.starts_with("!translate ") {
+            if !state.admin_users.contains(&event.sender) {
+                warn!("!translate from non-admin {} — ignored", event.sender);
                 return;
             }
-        };
-        state
-            .verification
-            .grant_device(target_user.clone(), target_device.clone())
-            .await;
-        match state
-            .verification
-            .request_device_verification(&target_user, &target_device)
-            .await
-        {
-            Ok(()) => info!(
-                "Started administrator-approved to-device verification for {} {}",
-                target_user, target_device
-            ),
-            Err(error) => warn!(
-                "Could not start to-device verification for {} {}: {}",
-                target_user, target_device, error
-            ),
-        }
-        return;
-    }
-
-    // Admin command: !reset-trust @user:server
-    if let Some(target) = raw.strip_prefix("!reset-trust ") {
-        if state.admin_users.contains(&event.sender) {
-            match target.trim().parse::<OwnedUserId>() {
-                Ok(target_user) => {
-                    state.verification.grant_user(target_user.clone()).await;
-                    info!(
-                        "Trust reset allowed for {} (by {})",
-                        target_user, event.sender
-                    );
-                }
-                Err(_) => warn!("!reset-trust: invalid user ID '{}'", target.trim()),
+            let rest = raw["!translate".len()..].trim();
+            let (subcommand, arg) = rest
+                .split_once(char::is_whitespace)
+                .map(|(a, b)| (a, b.trim()))
+                .unwrap_or((rest, ""));
+            let reply = match subcommand {
+                "status" => translate_status_report(&state).await,
+                "stats" => translate_stats_report(&state),
+                "debug" => translate_debug_report(&state, arg),
+                "version" => translate_version_report(),
+                "retry" => translate_retry_command(&state, &room, arg).await,
+                _ => "Usage: !translate <status|stats|debug <event-id>|retry <event-id>|version>"
+                    .to_owned(),
+            };
+            if let Err(e) = room.send(RoomMessageEventContent::notice_plain(reply)).await {
+                warn!("Failed to send !translate reply: {e}");
             }
-        } else {
-            warn!("!reset-trust from non-admin {} — ignored", event.sender);
+            return;
         }
-        return;
     }
 
-    // Strip the leading Matrix reply-fallback block: consecutive "> " lines at the top
-    // followed by a blank separator line.  Only the top block is removed so that
-    // intentional blockquotes later in the message are preserved.
-    let text: String = if raw.starts_with("> ") {
-        raw.lines()
-            .skip_while(|l| l.starts_with("> "))
-            .skip_while(|l| l.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        raw.to_owned()
-    };
+    let text = strip_reply_fallback(raw);
     let text = text.trim();
     if text.is_empty() {
+        record_skip(
+            &state,
+            &event.event_id,
+            &room_id,
+            Some(&sender),
+            msgtype_label,
+            "body",
+            SkipReason::EmptyText,
+        );
+        return;
+    }
+    if text.chars().count() > MAX_INPUT_CHARS {
+        record_skip(
+            &state,
+            &event.event_id,
+            &room_id,
+            Some(&sender),
+            msgtype_label,
+            "body",
+            SkipReason::InputTooLong,
+        );
         return;
     }
 
     let Some((lang, confidence)) = state.detect(text).await else {
         warn!(
             "Language detection failed for {} in {} ({})",
-            event.event_id,
-            room.room_id(),
-            event.sender
+            event.event_id, room_id, event.sender
+        );
+        record_skip(
+            &state,
+            &event.event_id,
+            &room_id,
+            Some(&sender),
+            msgtype_label,
+            "body",
+            SkipReason::LangDetectFailed,
         );
         return;
     };
 
     info!(
         "{} lang={lang} conf={confidence:.2} sender={} room={}",
-        event.event_id,
-        event.sender,
-        room.room_id()
+        event.event_id, event.sender, room_id
     );
 
-    let translation = state.translation_for_room(room.room_id().as_str());
+    let translation = state.translation_for_room(&room_id);
 
-    let Some(targets) = resolve_translation_targets(
+    let targets = match resolve_translation_targets(
         "message",
-        room.room_id().as_str(),
+        &room_id,
         &event.event_id,
         &lang,
         confidence,
         &translation,
-    ) else {
-        return;
+    ) {
+        Ok(targets) => targets,
+        Err(reason) => {
+            record_skip(
+                &state,
+                &event.event_id,
+                &room_id,
+                Some(&sender),
+                msgtype_label,
+                "body",
+                reason,
+            );
+            return;
+        }
     };
 
-    let html_to_translate = match &text_content.formatted {
+    let html_to_translate = match formatted {
         Some(fb) if fb.format == MessageFormat::Html => Some(strip_mx_reply(&fb.body)),
         _ => None,
     };
@@ -2817,9 +3669,9 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         &state,
         input,
         &lang,
-        targets,
+        targets.clone(),
         "message",
-        room.room_id().as_str(),
+        &room_id,
         &event.event_id,
     )
     .await
@@ -2842,21 +3694,21 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         in_thread,
     );
 
-    match room.send(content).await {
-        Ok(resp) => {
-            match state.translation_map.write() {
-                Ok(mut map) => {
-                    map.insert(event.event_id.clone(), resp.response.event_id);
-                    if map.len() > 10_000 {
-                        // Prevent unbounded growth — edit/redact tracking for very old
-                        // messages is sacrificed before memory becomes a problem.
-                        map.retain(|_, _| false);
-                        warn!("translation_map cleared after exceeding 10 000 entries");
-                    }
-                }
-                Err(e) => warn!("translation_map lock poisoned on write: {e}"),
-            }
-        }
+    let send_result = send_with_retry(&room, &event.event_id, content).await;
+    record_translated(
+        &state,
+        &event.event_id,
+        &room_id,
+        &sender,
+        msgtype_label,
+        "body",
+        &lang,
+        &targets,
+        send_result.is_ok(),
+        started.elapsed(),
+    );
+    match send_result {
+        Ok(bot_event_id) => record_translation(&state, event.event_id.clone(), bot_event_id),
         Err(e) => error!("Failed to send translation: {e}"),
     }
 }
@@ -2872,6 +3724,29 @@ fn resolve_thread_root(event: &OriginalSyncRoomMessageEvent) -> OwnedEventId {
     }
 }
 
+/// Extracts the translatable text from an edit's new content: the body
+/// (reply-fallback stripped) for `m.text`/`m.emote`, or the caption for
+/// caption-bearing media types (a caption can itself be edited — the new
+/// content then carries the same media msgtype as the original). Returns
+/// `None` when there is nothing translatable (unsupported msgtype, a
+/// filename-only caption, or empty text).
+fn extract_edit_text(msgtype: &MessageType) -> Option<String> {
+    let raw = match msgtype {
+        MessageType::Text(t) => t.body.as_str(),
+        MessageType::Emote(e) => e.body.as_str(),
+        other => {
+            let (_, caption) = media_caption_kind(other)?;
+            return caption
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+        }
+    };
+    let text = strip_reply_fallback(raw.trim());
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
 /// Called when a user edits a message the bot previously translated.
 /// Re-translates the new content and edits the bot's existing translation
 /// in-place using m.replace — no new message is sent, thread context is preserved.
@@ -2881,6 +3756,10 @@ async fn handle_edit(
     original_event_id: OwnedEventId,
     new_content: RoomMessageEventContentWithoutRelation,
 ) {
+    let started = Instant::now();
+    let room_id = room.room_id().as_str().to_owned();
+    let msgtype_label = new_content.msgtype.msgtype();
+
     // Look up whether we have a translation for this event.
     let bot_event_id = match state.translation_map.read() {
         Ok(map) => map.get(&original_event_id).cloned(),
@@ -2892,59 +3771,101 @@ async fn handle_edit(
 
     let Some(bot_event_id) = bot_event_id else {
         info!("Edit for unknown event {original_event_id} — no cached translation, ignoring");
-        return;
-    };
-
-    // Use ONLY m.new_content as the source of truth (full replacement, not a diff).
-    let MessageType::Text(text_content) = &new_content.msgtype else {
-        return;
-    };
-    let raw = text_content.body.trim();
-
-    // Strip the leading reply-fallback block only — same logic as handle_message,
-    // so mid-body intentional blockquotes are preserved.
-    let text: String = if raw.starts_with("> ") {
-        raw.lines()
-            .skip_while(|l| l.starts_with("> "))
-            .skip_while(|l| l.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        raw.to_owned()
-    };
-    let text = text.trim();
-    if text.is_empty() {
-        return;
-    }
-
-    let Some((lang, confidence)) = state.detect(text).await else {
-        warn!(
-            "Language detection failed for edit of {original_event_id} in {}",
-            room.room_id()
+        record_skip(
+            &state,
+            &original_event_id,
+            &room_id,
+            None,
+            msgtype_label,
+            "edit",
+            SkipReason::EditUnknownEvent,
         );
         return;
     };
 
-    let translation = state.translation_for_room(room.room_id().as_str());
+    // Use ONLY m.new_content as the source of truth (full replacement, not a diff).
+    let Some(text) = extract_edit_text(&new_content.msgtype) else {
+        info!(
+            "Skipping edit of {original_event_id}: no translatable text in new content (msgtype={})",
+            msgtype_label
+        );
+        record_skip(
+            &state,
+            &original_event_id,
+            &room_id,
+            None,
+            msgtype_label,
+            "edit",
+            SkipReason::EditNoTranslatableText,
+        );
+        return;
+    };
+    if text.chars().count() > MAX_INPUT_CHARS {
+        info!(
+            "Skipping edit of {original_event_id}: input is {} chars, exceeds MAX_INPUT_CHARS={MAX_INPUT_CHARS}",
+            text.chars().count()
+        );
+        record_skip(
+            &state,
+            &original_event_id,
+            &room_id,
+            None,
+            msgtype_label,
+            "edit",
+            SkipReason::InputTooLong,
+        );
+        return;
+    }
+    let text = text.as_str();
 
-    let Some(targets) = resolve_translation_targets(
+    let Some((lang, confidence)) = state.detect(text).await else {
+        warn!(
+            "Language detection failed for edit of {original_event_id} in {room_id}"
+        );
+        record_skip(
+            &state,
+            &original_event_id,
+            &room_id,
+            None,
+            msgtype_label,
+            "edit",
+            SkipReason::LangDetectFailed,
+        );
+        return;
+    };
+
+    let translation = state.translation_for_room(&room_id);
+
+    let targets = match resolve_translation_targets(
         "edit",
-        room.room_id().as_str(),
+        &room_id,
         &original_event_id,
         &lang,
         confidence,
         &translation,
-    ) else {
-        return;
+    ) {
+        Ok(targets) => targets,
+        Err(reason) => {
+            record_skip(
+                &state,
+                &original_event_id,
+                &room_id,
+                None,
+                msgtype_label,
+                "edit",
+                reason,
+            );
+            return;
+        }
     };
 
     let lines = match translate_all_targets(
         &state,
         TranslationInput::Text { plain: text },
         &lang,
-        targets,
+        targets.clone(),
         "edit",
-        room.room_id().as_str(),
+        &room_id,
         &original_event_id,
     )
     .await
@@ -2980,7 +3901,20 @@ async fn handle_edit(
     )));
 
     info!("Editing bot translation {bot_event_id} for edit of {original_event_id}");
-    if let Err(e) = room.send(edit_content).await {
+    let send_result = send_with_retry(&room, &original_event_id, edit_content).await;
+    record_translated(
+        &state,
+        &original_event_id,
+        &room_id,
+        "-",
+        msgtype_label,
+        "edit",
+        &lang,
+        &targets,
+        send_result.is_ok(),
+        started.elapsed(),
+    );
+    if let Err(e) = send_result {
         error!("Failed to send translation edit: {e}");
     }
 }
