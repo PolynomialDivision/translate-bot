@@ -731,7 +731,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    let startup_time = SystemTime::now();
     let backend_concurrency = config.translation.backend_concurrency.max(1);
 
     let verification = VerificationService::allowlisted_tofu(
@@ -751,12 +750,17 @@ async fn main() -> Result<()> {
     );
     verification.install_handlers();
 
-    let state = BotState {
+    let mut state = BotState {
         lt_url: config.libretranslate.url.trim_end_matches('/').to_owned(),
         lt_api_key: config.libretranslate.api_key,
         translation: config.translation,
         room_translations: config.room_translations,
-        startup_time,
+        // Placeholder — the real cutoff is set below, once handlers are about
+        // to be registered. It must not be captured this early: everything
+        // above (session restore, the ltengine probe, sync_once itself) can
+        // take several seconds, and a live message sent during that window
+        // would otherwise be misclassified as backlog and silently dropped.
+        startup_time: SystemTime::now(),
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
@@ -835,6 +839,14 @@ async fn main() -> Result<()> {
             }
         }
     }
+
+    // Recompute the backlog cutoff now, right before handlers that act on it
+    // are registered. sync_once (the primary backlog defence) has already
+    // drained pre-restart history above without any handlers installed to
+    // react to it; this belt-and-suspenders check in handle_message should
+    // therefore only ever catch messages older than *this* point, not
+    // messages merely older than process start.
+    state.startup_time = SystemTime::now();
 
     // Auto-join invited rooms (only from allowed_inviters)
     client.add_event_handler({
@@ -1581,6 +1593,135 @@ mod tests {
         assert_eq!(body, "plain text");
     }
 
+    // ── media_caption_kind tests ─────────────────────────────────────────────
+    // Covers the event that prompted this: an m.image with a real caption
+    // ($6qLBtCRwYLUXpbr2zsyC-tAoaHSZUzz7kdksYQc09Ig, body "Hat jemand
+    // Interesse an einer Couch?", filename "1000006546.jpg") turned out not
+    // to be a msgtype-matching bug — these tests pin down the matching logic
+    // regardless.
+
+    use matrix_sdk::ruma::{
+        events::room::{
+            message::{
+                AudioMessageEventContent, FileMessageEventContent, ImageMessageEventContent,
+                LocationMessageEventContent, VideoMessageEventContent,
+            },
+            EncryptedFile, EncryptedFileHashes, EncryptedFileInfo, V2EncryptedFileInfo,
+        },
+        OwnedMxcUri,
+    };
+
+    fn mxc() -> OwnedMxcUri {
+        "mxc://example.org/abc123".into()
+    }
+
+    fn dummy_encrypted_file() -> EncryptedFile {
+        EncryptedFile::new(
+            mxc(),
+            EncryptedFileInfo::V2(V2EncryptedFileInfo::encode([0u8; 32], [0u8; 16])),
+            EncryptedFileHashes::with_sha256([0u8; 32]),
+        )
+    }
+
+    #[test]
+    fn media_caption_kind_text_is_not_media() {
+        let msgtype = MessageType::Text(TextMessageEventContent::plain("hello"));
+        assert_eq!(media_caption_kind(&msgtype), None);
+    }
+
+    #[test]
+    fn media_caption_kind_image_with_real_caption() {
+        let mut content = ImageMessageEventContent::plain(
+            "Hat jemand Interesse an einer Couch?".into(),
+            mxc(),
+        );
+        content.filename = Some("1000006546.jpg".into());
+        let msgtype = MessageType::Image(content);
+        assert_eq!(
+            media_caption_kind(&msgtype),
+            Some(("image", Some("Hat jemand Interesse an einer Couch?")))
+        );
+    }
+
+    #[test]
+    fn media_caption_kind_image_filename_equal_to_body_has_no_caption() {
+        let mut content = ImageMessageEventContent::plain("1000006546.jpg".into(), mxc());
+        content.filename = Some("1000006546.jpg".into());
+        let msgtype = MessageType::Image(content);
+        assert_eq!(media_caption_kind(&msgtype), Some(("image", None)));
+    }
+
+    #[test]
+    fn media_caption_kind_image_without_filename_field_has_no_caption() {
+        // Older/other clients may omit `filename` entirely and just send the
+        // filename as `body` — caption() requires filename to be set to
+        // recognize body as a distinct caption, per the Matrix spec.
+        let content = ImageMessageEventContent::plain("1000006546.jpg".into(), mxc());
+        let msgtype = MessageType::Image(content);
+        assert_eq!(media_caption_kind(&msgtype), Some(("image", None)));
+    }
+
+    #[test]
+    fn media_caption_kind_encrypted_image_caption_still_available() {
+        // The media file being end-to-end encrypted (MediaSource::Encrypted)
+        // is orthogonal to whether a plaintext caption is present — by the
+        // time the bot's handler sees the event, room-level E2EE has already
+        // been decrypted by matrix-sdk-crypto, and caption() only looks at
+        // `body`/`filename`, never `source`.
+        let mut content = ImageMessageEventContent::encrypted(
+            "Hat jemand Interesse an einer Couch?".into(),
+            dummy_encrypted_file(),
+        );
+        content.filename = Some("1000006546.jpg".into());
+        let msgtype = MessageType::Image(content);
+        assert_eq!(
+            media_caption_kind(&msgtype),
+            Some(("image", Some("Hat jemand Interesse an einer Couch?")))
+        );
+    }
+
+    #[test]
+    fn media_caption_kind_file_with_caption() {
+        let mut content = FileMessageEventContent::plain("Rechnung anbei".into(), mxc());
+        content.filename = Some("invoice.pdf".into());
+        let msgtype = MessageType::File(content);
+        assert_eq!(
+            media_caption_kind(&msgtype),
+            Some(("file", Some("Rechnung anbei")))
+        );
+    }
+
+    #[test]
+    fn media_caption_kind_video_with_caption() {
+        let mut content = VideoMessageEventContent::plain("Schau mal!".into(), mxc());
+        content.filename = Some("clip.mp4".into());
+        let msgtype = MessageType::Video(content);
+        assert_eq!(
+            media_caption_kind(&msgtype),
+            Some(("video", Some("Schau mal!")))
+        );
+    }
+
+    #[test]
+    fn media_caption_kind_audio_with_caption() {
+        let mut content = AudioMessageEventContent::plain("Hör dir das an".into(), mxc());
+        content.filename = Some("voice.ogg".into());
+        let msgtype = MessageType::Audio(content);
+        assert_eq!(
+            media_caption_kind(&msgtype),
+            Some(("audio", Some("Hör dir das an")))
+        );
+    }
+
+    #[test]
+    fn media_caption_kind_unsupported_type_is_ignored() {
+        let msgtype = MessageType::Location(LocationMessageEventContent::new(
+            "shared a location".into(),
+            "geo:0,0".into(),
+        ));
+        assert_eq!(media_caption_kind(&msgtype), None);
+    }
+
     // ── make_relation tests ───────────────────────────────────────────────────
 
     fn eid(s: &str) -> OwnedEventId {
@@ -1938,7 +2079,7 @@ max_concurrent = 4
 
     // ── Image caption path integration ───────────────────────────────────────
     //
-    // handle_image_caption() builds its relation with exactly:
+    // handle_media_caption() builds its relation with exactly:
     //
     //   let thread_root = resolve_thread_root(&event);
     //   content.relates_to = make_relation(
@@ -1988,7 +2129,7 @@ max_concurrent = 4
         let thread_root = thread_root_id.clone();
 
         let mut content = make_translation_content("🇩🇪 Hallo".into(), "🇩🇪 Hallo".into(), false);
-        // in_thread=true mirrors what handle_image_caption now passes
+        // in_thread=true mirrors what handle_media_caption now passes
         content.relates_to = make_relation(&caption_event_id, &thread_root, true, false, true);
 
         let json = serde_json::to_value(&content).unwrap();
@@ -2416,15 +2557,19 @@ fn make_translation_content(plain: String, html: String, silent: bool) -> RoomMe
     }
 }
 
-async fn handle_image_caption(
+/// Handles a caption attached to a media message (`m.image`, `m.video`,
+/// `m.audio`, `m.file`). `kind` is the short label used in logs and as the
+/// translation-target-resolution context (e.g. `"image"`, `"video"`).
+async fn handle_media_caption(
     state: BotState,
     room: Room,
     event: OriginalSyncRoomMessageEvent,
     caption: String,
+    kind: &'static str,
 ) {
     let Some((lang, confidence)) = state.detect(&caption).await else {
         warn!(
-            "Language detection failed for image caption {} in {} ({})",
+            "Language detection failed for {kind} caption {} in {} ({})",
             event.event_id,
             room.room_id(),
             event.sender
@@ -2433,7 +2578,7 @@ async fn handle_image_caption(
     };
 
     info!(
-        "image caption {} lang={lang} conf={confidence:.2} sender={} room={}",
+        "{kind} caption {} lang={lang} conf={confidence:.2} sender={} room={}",
         event.event_id,
         event.sender,
         room.room_id()
@@ -2442,7 +2587,7 @@ async fn handle_image_caption(
     let translation = state.translation_for_room(room.room_id().as_str());
 
     let Some(targets) = resolve_translation_targets(
-        "image_caption",
+        kind,
         room.room_id().as_str(),
         &event.event_id,
         &lang,
@@ -2457,7 +2602,7 @@ async fn handle_image_caption(
         TranslationInput::Text { plain: &caption },
         &lang,
         targets,
-        "image_caption",
+        kind,
         room.room_id().as_str(),
         &event.event_id,
     )
@@ -2479,14 +2624,32 @@ async fn handle_image_caption(
     );
 
     if let Err(e) = room.send(content).await {
-        error!("Failed to send image caption translation: {e}");
+        error!("Failed to send {kind} caption translation: {e}");
+    }
+}
+
+/// Returns `Some((kind, caption))` for a msgtype that has a caption slot
+/// (`m.image`, `m.video`, `m.audio`, `m.file`) — `caption` is `None` when the
+/// slot is present but unused (no `filename` set, or `body == filename`, per
+/// the Matrix media-caption spec: https://spec.matrix.org/v1.18/client-server-api/#media-captions).
+/// Returns `None` for msgtypes that have no caption slot at all (`m.text`,
+/// `m.location`, `m.emote`, etc.) — those are handled elsewhere or ignored.
+fn media_caption_kind(msgtype: &MessageType) -> Option<(&'static str, Option<&str>)> {
+    match msgtype {
+        MessageType::Image(m) => Some(("image", m.caption())),
+        MessageType::Video(m) => Some(("video", m.caption())),
+        MessageType::Audio(m) => Some(("audio", m.caption())),
+        MessageType::File(m) => Some(("file", m.caption())),
+        _ => None,
     }
 }
 
 async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMessageEvent) {
-    // Belt-and-suspenders: skip any event that predates bot startup.
-    // The primary defence is sync_once running before handlers are registered,
-    // which prevents backlog events from reaching this function at all.
+    // Belt-and-suspenders: skip any event that predates the cutoff captured
+    // just before handlers were registered (see `main`). The primary defence
+    // is sync_once running before handlers are registered at all, which
+    // prevents backlog events from reaching this function in the first
+    // place; this check only catches whatever slips through that.
     if let Some(event_time) = event.origin_server_ts.to_system_time() {
         if event_time < state.startup_time {
             info!(
@@ -2507,21 +2670,34 @@ async fn handle_message(state: BotState, room: Room, event: OriginalSyncRoomMess
         return;
     }
 
-    // Handle image messages — translate caption if present.
-    if let MessageType::Image(img) = &event.content.msgtype {
-        let caption = img
-            .caption()
+    // Media messages can carry a user-written caption in `body`. Per the
+    // Matrix media-caption spec, `caption()` only returns it when `body`
+    // differs from `filename` — a bare filename (e.g. "1000006546.jpg") is
+    // never mistaken for a caption.
+    if let Some((kind, caption)) = media_caption_kind(&event.content.msgtype) {
+        let caption = caption
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
-        // img borrow ends here; event can be moved below
-        if let Some(caption) = caption {
-            handle_image_caption(state, room, event, caption).await;
+        match caption {
+            Some(caption) => {
+                info!("Translating caption from m.{kind} event {}", event.event_id);
+                handle_media_caption(state, room, event, caption, kind).await;
+            }
+            None => info!(
+                "Skipping event {}: m.{kind} has no translatable caption",
+                event.event_id
+            ),
         }
         return;
     }
 
     let MessageType::Text(text_content) = &event.content.msgtype else {
+        info!(
+            "Skipping event {}: msgtype {} is not translatable",
+            event.event_id,
+            event.content.msgtype.msgtype()
+        );
         return;
     };
 
