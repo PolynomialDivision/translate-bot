@@ -70,7 +70,7 @@ use pulldown_cmark::{Options, Parser};
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Notify, Semaphore},
     time::{sleep, timeout},
 };
 use tracing::{error, info, warn};
@@ -588,6 +588,12 @@ struct BotState {
     // best-effort event-outcome history — survives process restarts.
     // See db.rs. Cheap to clone (Arc<Mutex<Connection>> internally).
     db: Db,
+    // Marks original event IDs whose translate-and-persist pipeline is
+    // currently running, so a same-event edit/redaction that races in before
+    // `db` has the row can wait for it instead of concluding there's nothing
+    // to update/delete. std Mutex: only ever held for a map lookup/insert,
+    // never across an await.
+    pending_translations: PendingMap,
 }
 
 impl BotState {
@@ -1059,6 +1065,7 @@ async fn main() -> Result<()> {
         lt_requests: Arc::new(Semaphore::new(backend_concurrency)),
         stats: Arc::new(Stats::new(db.clone())),
         db,
+        pending_translations: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
 
     // Probe ltengine reachability at startup so failures are visible in logs.
@@ -1287,51 +1294,25 @@ async fn main() -> Result<()> {
 
     // Redactions: if a user deletes their original message, delete the bot's
     // translation too — including thread replies that would otherwise be orphaned.
+    // Spawned (with the same inflight permit as regular messages) rather than
+    // run inline: `handle_redaction` can wait up to `PENDING_TRANSLATION_WAIT`
+    // for a same-event translation still in flight, and that must not block
+    // the sync loop from dispatching the rest of this (or the next) batch.
     client.add_event_handler({
         let state = state.clone();
         move |ev: OriginalSyncRoomRedactionEvent, room: Room| {
             let state = state.clone();
             async move {
                 // `redacts` can be None in some room versions / federation edge cases.
-                let redacted_id = match ev.redacts {
-                    Some(ref id) => id.clone(),
-                    None => {
-                        warn!("Redaction event has no `redacts` field — ignoring");
-                        return;
-                    }
-                };
-
-                // Check whether we have a translation for this event.
-                let bot_event_id = match state.db.lookup_translation(redacted_id.as_str()).await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        warn!("Failed to look up translation for redacted {redacted_id}: {e}");
-                        return;
-                    }
-                };
-
-                let Some(bot_event_id) = bot_event_id else {
+                let Some(redacted_id) = ev.redacts.clone() else {
+                    warn!("Redaction event has no `redacts` field — ignoring");
                     return;
                 };
-                let Ok(bot_event_id) = matrix_sdk::ruma::EventId::parse(&bot_event_id) else {
-                    warn!("Stored bot_event_id '{bot_event_id}' for {redacted_id} is not a valid event ID");
-                    return;
-                };
-
-                info!(
-                    "Original message {redacted_id} was redacted — \
-                     redacting bot translation {bot_event_id}"
-                );
-
-                if let Err(e) = room.redact(&bot_event_id, None, None).await {
-                    warn!("Failed to redact translation {bot_event_id}: {e}");
-                    return;
-                }
-
-                // Remove from DB so we don't attempt a double-redact.
-                if let Err(e) = state.db.remove_translation(redacted_id.as_str()).await {
-                    warn!("Failed to remove translation record for {redacted_id}: {e}");
-                }
+                let inflight = Arc::clone(&state.inflight);
+                tokio::spawn(async move {
+                    let _permit = inflight.acquire_owned().await;
+                    handle_redaction(state, room, redacted_id).await;
+                });
             }
         }
     });
@@ -2620,6 +2601,125 @@ max_concurrent = 4
             "caption with reply_to_original=false must produce no relation"
         );
     }
+
+    // ── lookup_translation_awaiting_pending / mark_pending ──────────────────
+    // These cover the edit/redaction race: an edit or redaction can be
+    // dispatched (as its own concurrent task) before the original message's
+    // own translate-and-persist pipeline has written its DB row yet.
+
+    fn test_pending() -> PendingMap {
+        Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn pending_guard_removes_entry_on_drop_and_wakes_a_waiter() {
+        let pending = test_pending();
+        let event_id = eid("$orig:example.org");
+        assert!(!pending.lock().unwrap().contains_key(event_id.as_str()));
+        {
+            let _guard = mark_pending(&pending, &event_id);
+            assert!(pending.lock().unwrap().contains_key(event_id.as_str()));
+        }
+        assert!(!pending.lock().unwrap().contains_key(event_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn lookup_translation_awaiting_pending_hits_immediately_when_already_recorded() {
+        let db = Db::open_in_memory().unwrap();
+        let pending = test_pending();
+        db.record_translation("$orig:example.org", "$bot:example.org", "!room:example.org")
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let found = lookup_translation_awaiting_pending(&db, &pending, "$orig:example.org")
+            .await
+            .unwrap();
+        assert_eq!(found, Some("$bot:example.org".to_owned()));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn lookup_translation_awaiting_pending_returns_none_fast_with_no_pending_and_no_row() {
+        // Case 6: a genuinely unmapped event (e.g. never translated, or old
+        // enough to have been pruned) must not hang or crash.
+        let db = Db::open_in_memory().unwrap();
+        let pending = test_pending();
+
+        let started = Instant::now();
+        let found = lookup_translation_awaiting_pending(&db, &pending, "$never-seen:example.org")
+            .await
+            .unwrap();
+        assert_eq!(found, None);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn lookup_translation_awaiting_pending_waits_for_in_flight_translation_to_land() {
+        // Simulates an edit/redaction racing in while the original message's
+        // handler is still between "detect/translate" and "record_translation".
+        let db = Db::open_in_memory().unwrap();
+        let pending = test_pending();
+        let original = "$orig:example.org";
+        let guard = mark_pending(&pending, &eid(original));
+
+        let db2 = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            db2.record_translation(original, "$bot:example.org", "!room:example.org")
+                .await
+                .unwrap();
+            drop(guard); // wakes the waiter via notify_one
+        });
+
+        let started = Instant::now();
+        let found = lookup_translation_awaiting_pending(&db, &pending, original)
+            .await
+            .unwrap();
+        assert_eq!(found, Some("$bot:example.org".to_owned()));
+        assert!(started.elapsed() >= Duration::from_millis(25));
+        assert!(started.elapsed() < PENDING_TRANSLATION_WAIT);
+    }
+
+    #[tokio::test]
+    async fn lookup_translation_awaiting_pending_returns_none_promptly_when_original_was_skipped() {
+        // The original message finishes without ever calling
+        // record_translation (e.g. below_confidence) — the waiter must be
+        // woken immediately by the guard's drop, not sit out the full
+        // PENDING_TRANSLATION_WAIT before concluding there's no mapping.
+        let db = Db::open_in_memory().unwrap();
+        let pending = test_pending();
+        let original = "$orig:example.org";
+        let guard = mark_pending(&pending, &eid(original));
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(guard);
+        });
+
+        let started = Instant::now();
+        let found = lookup_translation_awaiting_pending(&db, &pending, original)
+            .await
+            .unwrap();
+        assert_eq!(found, None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn lookup_translation_awaiting_pending_unrelated_event_is_unaffected() {
+        // Reply/thread relations (or any other event) must never be confused
+        // with the event actually being awaited.
+        let db = Db::open_in_memory().unwrap();
+        let pending = test_pending();
+        let _guard = mark_pending(&pending, &eid("$unrelated:example.org"));
+
+        let started = Instant::now();
+        let found = lookup_translation_awaiting_pending(&db, &pending, "$orig:example.org")
+            .await
+            .unwrap();
+        assert_eq!(found, None);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
 }
 
 /// Parse `markdown` and return the indices + full text of every `Event::Text`
@@ -3118,6 +3218,79 @@ async fn send_with_retry(
     unreachable!("loop above always returns on its final iteration")
 }
 
+/// How long an edit or redaction will wait for a same-event translation that
+/// is still in flight (detection + translation + Matrix send can take a few
+/// seconds, longer under retries) before giving up and treating the event as
+/// having no mapping.
+const PENDING_TRANSLATION_WAIT: Duration = Duration::from_secs(30);
+
+/// RAII marker that `event_id`'s translate-and-persist pipeline is running.
+/// A same-event edit or redaction that arrives before this finishes — a real
+/// race, since edits/redactions can land within milliseconds of the original
+/// — can wait on it via [`lookup_translation_awaiting_pending`] instead of
+/// concluding there is no translation to update/delete. Dropped on every
+/// exit path (success, skip, or early return) and wakes at most one waiter
+/// via `Notify::notify_one`, which stores its permit if nobody is waiting
+/// yet, so the wake can never be lost regardless of interleaving.
+type PendingMap = Arc<std::sync::Mutex<HashMap<String, Arc<Notify>>>>;
+
+struct PendingGuard {
+    pending: PendingMap,
+    key: String,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        let notify = self.pending.lock().unwrap().remove(&self.key);
+        if let Some(notify) = notify {
+            notify.notify_one();
+        }
+    }
+}
+
+fn mark_pending(pending: &PendingMap, event_id: &OwnedEventId) -> PendingGuard {
+    let key = event_id.as_str().to_owned();
+    pending
+        .lock()
+        .unwrap()
+        .insert(key.clone(), Arc::new(Notify::new()));
+    PendingGuard {
+        pending: pending.clone(),
+        key,
+    }
+}
+
+/// Looks up the bot's translation for `original_event_id`, waiting briefly
+/// for an in-flight translation of the same event to finish first if one is
+/// running. Without this, an edit or redaction that races ahead of the
+/// original message's own translate-and-persist pipeline (both are dispatched
+/// as independent concurrent tasks) would find no row yet and wrongly
+/// conclude there is nothing to update/delete.
+async fn lookup_translation_awaiting_pending(
+    db: &Db,
+    pending: &PendingMap,
+    original_event_id: &str,
+) -> Result<Option<String>> {
+    // Snapshot the in-flight handle (if any) *before* re-checking the DB, so
+    // a task that finishes between our first check and this one can't race
+    // us out of seeing its notification — notify_one() stores its permit if
+    // it fires before anyone is waiting yet.
+    let notify = pending.lock().unwrap().get(original_event_id).cloned();
+
+    if let Some(found) = db.lookup_translation(original_event_id).await? {
+        return Ok(Some(found));
+    }
+    let Some(notify) = notify else {
+        return Ok(None);
+    };
+    info!(
+        "Edit/redaction for {original_event_id} arrived while its translation was still in \
+         flight — waiting up to {PENDING_TRANSLATION_WAIT:?}"
+    );
+    let _ = timeout(PENDING_TRANSLATION_WAIT, notify.notified()).await;
+    db.lookup_translation(original_event_id).await
+}
+
 /// Durably records that `original_event_id` was translated into
 /// `bot_event_id`, so a later edit or redaction — even after a restart —
 /// can find and update/remove the bot's translation. Awaited synchronously
@@ -3579,6 +3752,12 @@ async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoo
         return;
     }
 
+    // From here on this event might end up translated — mark it "pending" so
+    // a same-event edit/redaction that races in before we're done (or before
+    // we decide to skip) waits for us instead of concluding there's no
+    // mapping. Held for the rest of this function, across every await below.
+    let _pending_guard = mark_pending(&state.pending_translations, &event.event_id);
+
     // Media messages can carry a user-written caption in `body`. Per the
     // Matrix media-caption spec, `caption()` only returns it when `body`
     // differs from `filename` — a bare filename (e.g. "1000006546.jpg") is
@@ -3863,6 +4042,49 @@ async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoo
     }
 }
 
+/// Called when a redaction event is received. If `redacted_id` is an original
+/// message the bot translated, redacts the bot's translation too and removes
+/// the now-stale mapping (so a later redaction of the same event, e.g. a
+/// federation replay, is a no-op rather than a repeat redact attempt).
+async fn handle_redaction(state: BotState, room: Room, redacted_id: OwnedEventId) {
+    let bot_event_id = match lookup_translation_awaiting_pending(
+        &state.db,
+        &state.pending_translations,
+        redacted_id.as_str(),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            warn!("Failed to look up translation for redacted {redacted_id}: {e}");
+            return;
+        }
+    };
+
+    let Some(bot_event_id) = bot_event_id else {
+        return;
+    };
+    let Ok(bot_event_id) = matrix_sdk::ruma::EventId::parse(&bot_event_id) else {
+        warn!("Stored bot_event_id '{bot_event_id}' for {redacted_id} is not a valid event ID");
+        return;
+    };
+
+    info!(
+        "Original message {redacted_id} was redacted — \
+         redacting bot translation {bot_event_id}"
+    );
+
+    if let Err(e) = room.redact(&bot_event_id, None, None).await {
+        warn!("Failed to redact translation {bot_event_id}: {e}");
+        return;
+    }
+
+    // Remove from DB so we don't attempt a double-redact.
+    if let Err(e) = state.db.remove_translation(redacted_id.as_str()).await {
+        warn!("Failed to remove translation record for {redacted_id}: {e}");
+    }
+}
+
 /// Determine the Matrix thread root for a given incoming event:
 ///
 /// 1. Event is already in a thread (`m.thread`) → use that thread's root.
@@ -3910,11 +4132,15 @@ async fn handle_edit(
     let room_id = room.room_id().as_str().to_owned();
     let msgtype_label = new_content.msgtype.msgtype();
 
-    // Look up whether we have a translation for this event.
-    let bot_event_id = match state
-        .db
-        .lookup_translation(original_event_id.as_str())
-        .await
+    // Look up whether we have a translation for this event — waiting briefly
+    // if the original message's own translation is still in flight (see
+    // `lookup_translation_awaiting_pending`).
+    let bot_event_id = match lookup_translation_awaiting_pending(
+        &state.db,
+        &state.pending_translations,
+        original_event_id.as_str(),
+    )
+    .await
     {
         Ok(id) => id,
         Err(e) => {
