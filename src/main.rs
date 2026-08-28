@@ -1317,20 +1317,41 @@ async fn main() -> Result<()> {
         }
     });
 
+    // client.sync() already retries transient network errors internally
+    // without returning; reaching the bottom of this loop means it gave up
+    // entirely (e.g. the homeserver is down for an extended period), so this
+    // outer retry backs off exponentially instead of hammering it every 5s —
+    // capped, and reset once a session has clearly been healthy again.
+    let mut sync_retry_backoff = SYNC_RETRY_INITIAL;
     loop {
+        let attempt_started = Instant::now();
         match client
             .sync(SyncSettings::default().filter(filter.clone().into()))
             .await
         {
             Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
-            Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
+            Err(e) => warn!("Sync loop error: {e} — reconnecting in {sync_retry_backoff:?}"),
         }
-        // client.sync() already retries transient network errors internally
-        // without returning; reaching here means it gave up entirely, so
-        // this is a coarse "how often did the whole sync loop have to
-        // restart" signal, not a per-request retry count.
         state.stats.sync_reconnects.fetch_add(1, Ordering::Relaxed);
-        sleep(Duration::from_secs(5)).await;
+        let healthy = attempt_started.elapsed() >= SYNC_HEALTHY_AFTER;
+        let delay = sync_retry_delay(sync_retry_backoff, healthy);
+        sleep(delay).await;
+        sync_retry_backoff = (delay * 2).min(SYNC_RETRY_MAX);
+    }
+}
+
+const SYNC_RETRY_INITIAL: Duration = Duration::from_secs(5);
+const SYNC_RETRY_MAX: Duration = Duration::from_secs(300);
+const SYNC_HEALTHY_AFTER: Duration = Duration::from_secs(60);
+
+/// Backoff for the outer sync-reconnect loop: reset to the floor after a
+/// session that ran long enough to count as healthy, otherwise keep the
+/// current backoff (the caller doubles it, capped, for the round after).
+fn sync_retry_delay(previous_backoff: Duration, attempt_was_healthy: bool) -> Duration {
+    if attempt_was_healthy {
+        SYNC_RETRY_INITIAL
+    } else {
+        previous_backoff
     }
 }
 
@@ -2602,6 +2623,34 @@ max_concurrent = 4
         );
     }
 
+    // ── sync_retry_delay ─────────────────────────────────────────────────
+
+    #[test]
+    fn sync_retry_delay_holds_backoff_when_unhealthy() {
+        assert_eq!(
+            sync_retry_delay(Duration::from_secs(80), false),
+            Duration::from_secs(80)
+        );
+    }
+
+    #[test]
+    fn sync_retry_delay_resets_to_floor_when_healthy() {
+        assert_eq!(
+            sync_retry_delay(Duration::from_secs(300), true),
+            SYNC_RETRY_INITIAL
+        );
+    }
+
+    #[test]
+    fn sync_retry_backoff_doubles_and_caps() {
+        let mut backoff = SYNC_RETRY_INITIAL;
+        for _ in 0..20 {
+            let delay = sync_retry_delay(backoff, false);
+            backoff = (delay * 2).min(SYNC_RETRY_MAX);
+        }
+        assert_eq!(backoff, SYNC_RETRY_MAX);
+    }
+
     // ── lookup_translation_awaiting_pending / mark_pending ──────────────────
     // These cover the edit/redaction race: an edit or redaction can be
     // dispatched (as its own concurrent task) before the original message's
@@ -3191,14 +3240,23 @@ fn classify_send_error(error: &matrix_sdk::Error) -> (bool, Option<Duration>) {
 /// it does not queue an unbounded, ever-growing backlog of retries, since
 /// each call is one bounded loop awaited directly by its caller (itself
 /// already serialized behind the `inflight`/`lt_requests` semaphores).
+///
+/// All attempts reuse the *same* transaction ID (fixed once, before the
+/// loop): the Matrix C-S API guarantees `PUT .../send/{eventType}/{txnId}` is
+/// idempotent per-txn-id, so if an earlier attempt's request actually reached
+/// the homeserver and was processed — just the *response* was lost to a
+/// timeout or connection reset, which `classify_send_error` cannot tell apart
+/// from a request that never arrived — a retry is answered with the original
+/// event instead of creating a duplicate translation message.
 async fn send_with_retry(
     room: &Room,
     event_id: &OwnedEventId,
     content: RoomMessageEventContent,
 ) -> Result<OwnedEventId, matrix_sdk::Error> {
     let mut backoff = MATRIX_SEND_INITIAL_BACKOFF;
+    let txn_id = matrix_sdk::ruma::TransactionId::new();
     for attempt in 1..=MATRIX_SEND_MAX_ATTEMPTS {
-        match room.send(content.clone()).await {
+        match room.send(content.clone()).with_transaction_id(txn_id.clone()).await {
             Ok(resp) => return Ok(resp.response.event_id),
             Err(e) => {
                 let (retryable, retry_after) = classify_send_error(&e);
@@ -3750,6 +3808,34 @@ async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoo
         let new_content = replacement.new_content.clone();
         handle_edit(state, room, original_event_id, new_content).await;
         return;
+    }
+
+    // Idempotency guard: if this event_id was already translated, don't do
+    // it again. Normally unreachable (each event is only ever dispatched
+    // once by matrix-sdk), but it's a cheap, indexed lookup that closes off
+    // a real failure mode — a process restart between sending the
+    // translation and the SDK's since-token being persisted, or `!translate
+    // retry` racing a live delivery of the same event — from ever producing
+    // a second translation of the same message.
+    match state.db.lookup_translation(event.event_id.as_str()).await {
+        Ok(Some(existing)) => {
+            info!(
+                "{} was already translated as {existing} — skipping duplicate delivery",
+                event.event_id
+            );
+            record_skip(
+                &state,
+                &event.event_id,
+                &room_id,
+                Some(&sender),
+                event.content.msgtype.msgtype(),
+                "n/a",
+                SkipReason::AlreadyTranslated,
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => warn!("Failed to check existing translation for {}: {e}", event.event_id),
     }
 
     // From here on this event might end up translated — mark it "pending" so
