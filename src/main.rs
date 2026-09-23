@@ -75,7 +75,11 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-const MAX_TRANSLATION_ABSOLUTE_CHARS: usize = 1_000;
+/// Upper bound for any translation, independent of the source. Must leave
+/// room for legitimate translations of the longest accepted input
+/// (`max_input_chars`), which can be longer than their source; runaway
+/// output is caught by the relative limit and the loop checks below.
+const MAX_TRANSLATION_ABSOLUTE_CHARS: usize = 3 * DEFAULT_MAX_INPUT_CHARS;
 const MAX_TRANSLATION_EXPANSION_FACTOR: usize = 6;
 const MAX_TRANSLATION_EXPANSION_SLACK: usize = 80;
 
@@ -202,8 +206,10 @@ fn default_translation_overall_timeout_secs() -> u64 {
     90
 }
 
+const DEFAULT_MAX_INPUT_CHARS: usize = 4_000;
+
 fn default_max_input_chars() -> usize {
-    4_000
+    DEFAULT_MAX_INPUT_CHARS
 }
 
 impl Default for TranslationConfig {
@@ -686,7 +692,7 @@ impl BotState {
 
             match serde_json::from_str::<TranslateResponse>(&body) {
                 Ok(result) => Ok(result.translated_text),
-                Err(e) if is_backend_busy_body(&body) => Err(TranslationError::new(
+                Err(_) if is_backend_busy_body(&body) => Err(TranslationError::new(
                     TranslationErrorKind::BackendBusy,
                     response_excerpt(&body),
                 )),
@@ -1070,13 +1076,31 @@ async fn main() -> Result<()> {
 
     // Probe ltengine reachability at startup so failures are visible in logs.
     info!("ltengine URL: {}", state.lt_url);
-    match state
+    // ltengine serves /health/ready (200 once the model is loaded, 503 while
+    // it is still downloading/loading). Other LibreTranslate backends don't
+    // have it, so fall back to /languages on 404.
+    let ready_probe = state
         .http
-        .get(format!("{}/languages", state.lt_url))
+        .get(format!("{}/health/ready", state.lt_url))
+        .timeout(Duration::from_secs(10))
         .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => info!("ltengine reachable at startup"),
+        .await;
+    let probe = match ready_probe {
+        Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+            state
+                .http
+                .get(format!("{}/languages", state.lt_url))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+        }
+        other => other,
+    };
+    match probe {
+        Ok(resp) if resp.status().is_success() => info!("ltengine ready at startup"),
+        Ok(resp) if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => warn!(
+            "ltengine reachable but its model is still loading — translations will be retried until it is ready"
+        ),
         Ok(resp) => warn!(
             "ltengine returned {} at startup — translations may fail",
             resp.status()
@@ -1827,6 +1851,16 @@ mod tests {
             translation_rejection_reason("mehfrach chat", translated),
             Some("translation contains repeated phrase loop")
         );
+    }
+
+    #[test]
+    fn accepts_long_translation_of_long_message() {
+        // Regression: translations over 1000 characters were always rejected
+        // although inputs up to max_input_chars (4000) are accepted.
+        let source: String = (0..200).map(|i| format!("Wort{i} ")).collect();
+        let translated: String = (0..200).map(|i| format!("Word{i}x ")).collect();
+        assert!(translated.chars().count() > 1_000);
+        assert_eq!(translation_rejection_reason(&source, &translated), None);
     }
 
     #[test]

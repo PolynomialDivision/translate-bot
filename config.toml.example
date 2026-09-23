@@ -21,6 +21,13 @@ api_key = "YOUR_API_KEY"
 # Option C: self-hosted (no API key needed by default)
 # url = "http://your-unraid-ip:5000"
 
+# Option D: LTEngine (TranslateGemma on a local GPU) on the same Docker
+# network as the bot (see LTEngine's docker-compose.yml, network "translate").
+# LTEngine translates one message at a time and queues the rest; keep
+# request_timeout_secs >= LTENGINE_QUEUE_TIMEOUT so queued requests are not
+# abandoned just before they run.
+# url = "http://ltengine:5050"
+
 [translation]
 # Languages to translate between (bot translates between these two)
 langs = ["en", "de", "uk"]

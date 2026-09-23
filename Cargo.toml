@@ -8,8 +8,8 @@ name = "translate-bot"
 path = "src/main.rs"
 
 [dependencies]
-matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
-matrix-sdk-crypto = "0.18"
+matrix-sdk = { version = "0.19.1", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
+matrix-sdk-crypto = "0.19.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,4 +25,4 @@ mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
 # (matrix-sdk-sqlite); declared directly so translate-bot can keep its own
 # sibling database in the same store/ directory, following the precedent
 # set by radar-bot's store/items.db alongside store/matrix_store/.
-rusqlite = "0.37"
+rusqlite = "0.40"
