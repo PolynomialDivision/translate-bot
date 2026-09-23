@@ -25,8 +25,15 @@ api_key = "YOUR_API_KEY"
 # network as the bot (see LTEngine's docker-compose.yml, network "translate").
 # LTEngine translates one message at a time and queues the rest; keep
 # request_timeout_secs >= LTENGINE_QUEUE_TIMEOUT so queued requests are not
-# abandoned just before they run.
+# abandoned just before they run. While LTEngine (re)loads its model it
+# answers 503 with Retry-After, which the bot waits for between attempts.
 # url = "http://ltengine:5050"
+#
+# Suggested [translation] timeouts for TranslateGemma 12B on a small GPU
+# (~5-8 tokens/s, a long message can take a minute per target language):
+#   request_timeout_secs = 300
+#   overall_timeout_secs = 600
+#   max_attempts = 5
 
 [translation]
 # Languages to translate between (bot translates between these two)

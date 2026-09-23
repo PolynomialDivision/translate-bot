@@ -300,6 +300,8 @@ enum TranslationErrorKind {
 struct TranslationError {
     kind: TranslationErrorKind,
     detail: String,
+    /// Server-suggested delay before retrying (HTTP `Retry-After`).
+    retry_after: Option<Duration>,
 }
 
 impl TranslationError {
@@ -307,7 +309,13 @@ impl TranslationError {
         Self {
             kind,
             detail: detail.into(),
+            retry_after: None,
         }
+    }
+
+    fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
     }
 
     fn is_transient(&self) -> bool {
@@ -676,6 +684,7 @@ impl BotState {
                 .map_err(|e| TranslationError::new(TranslationErrorKind::Request, e.to_string()))?;
 
             let status = resp.status();
+            let retry_after = parse_retry_after(resp.headers());
             let body = resp
                 .text()
                 .await
@@ -687,7 +696,8 @@ impl BotState {
                 } else {
                     TranslationErrorKind::HttpStatus(status.as_u16())
                 };
-                return Err(TranslationError::new(kind, response_excerpt(&body)));
+                return Err(TranslationError::new(kind, response_excerpt(&body))
+                    .with_retry_after(retry_after));
             }
 
             match serde_json::from_str::<TranslateResponse>(&body) {
@@ -727,6 +737,19 @@ where
             format!("request exceeded {}s", request_timeout.as_secs()),
         )
     })?
+}
+
+/// `Retry-After` in seconds (ltengine sends it while loading or busy),
+/// capped so a bad header cannot stall a translation for long.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let seconds: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds.min(60)))
 }
 
 fn is_backend_busy_body(body: &str) -> bool {
@@ -787,10 +810,14 @@ where
                     error.detail
                 );
                 stats.retries.fetch_add(1, Ordering::Relaxed);
-                if !backoff.is_zero() {
-                    sleep(backoff).await;
-                    backoff = backoff.saturating_mul(2);
+                // Honour the backend's Retry-After (e.g. ltengine loading its
+                // model after a restart) instead of burning all attempts
+                // within a second. The overall timeout still bounds this.
+                let wait = error.retry_after.map_or(backoff, |ra| ra.max(backoff));
+                if !wait.is_zero() {
+                    sleep(wait).await;
                 }
+                backoff = backoff.saturating_mul(2);
             }
             Err(error) => {
                 return Err(TargetTranslationFailure {
@@ -1030,6 +1057,9 @@ async fn main() -> Result<()> {
     }
 
     let backend_concurrency = config.translation.backend_concurrency.max(1);
+    // Hard cap for any backend HTTP call; must never cut off a translation
+    // that is still within the configured request_timeout_secs.
+    let http_timeout = Duration::from_secs(config.translation.request_timeout_secs.max(300) + 30);
 
     let verification = VerificationService::allowlisted_tofu(
         client.clone(),
@@ -1060,7 +1090,7 @@ async fn main() -> Result<()> {
         // would otherwise be misclassified as backlog and silently dropped.
         startup_time: SystemTime::now(),
         http: reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(http_timeout)
             .build()
             .expect("failed to build HTTP client"),
         bot_user_id: user_id,
@@ -1851,6 +1881,18 @@ mod tests {
             translation_rejection_reason("mehfrach chat", translated),
             Some("translation contains repeated phrase loop")
         );
+    }
+
+    #[test]
+    fn retry_after_header_is_parsed_and_capped() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&headers), None);
+        headers.insert(reqwest::header::RETRY_AFTER, "10".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(10)));
+        headers.insert(reqwest::header::RETRY_AFTER, "3600".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(60)));
+        headers.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), None);
     }
 
     #[test]
