@@ -1776,8 +1776,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2afc652a144822f6fbe24084e08bc59cb483fd0b504396d492131dec0749396e"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
 dependencies = [
  "anymap2",
  "as_variant",
@@ -1830,8 +1829,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-base"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d98114e35b09143eb0db0c1679176d56d9bcddd141546d7de272a87e6dc94e"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
 dependencies = [
  "as_variant",
  "async-trait",
@@ -1858,8 +1856,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-common"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "457c2b3c8995cb0f20b882ece41f5a31f07e4e556bafbe37c2c8f3f2d02f638f"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
 dependencies = [
  "eyeball-im",
  "futures-core",
@@ -1882,8 +1879,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-crypto"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6851a6f102574c52430bd3617f86fb0def62f912fd2aed5356dcb8ff06a9fbc3"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
 dependencies = [
  "aes",
  "as_variant",
@@ -1922,8 +1918,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-indexeddb"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d24e5bf2450df25451596d62b8af6e016bc6b47be78ae1e30a72985c1e4b6001"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1955,8 +1950,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-sqlite"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d4271e06d52a17bc6ec39b5a2985b65dcced737969fac3678967783656edb34"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
 dependencies = [
  "as_variant",
  "async-trait",
@@ -1984,8 +1978,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-store-encryption"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "295c10317b47b20f0381743b16634be95fdcf244f0c0b85005cd53beb0797906"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#694e5b146423d5f9d0ae75a4c215a85f5d21d214"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -2084,16 +2077,19 @@ dependencies = [
 
 [[package]]
 name = "mxbot-common"
-version = "0.1.0"
-source = "git+https://github.com/PolynomialDivision/mxbot-common#f1196f44ea2ffa21c908df52e3cd8d1907f8f813"
+version = "0.2.0"
+source = "git+https://github.com/PolynomialDivision/mxbot-common#89d0ed0b60e60ee7beeb4cf79f83197cc87943ce"
 dependencies = [
  "anyhow",
  "futures-util",
  "matrix-sdk",
  "matrix-sdk-crypto",
  "serde",
+ "serde_json",
  "tokio",
+ "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3658,8 +3654,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
- "matrix-sdk",
- "matrix-sdk-crypto",
  "mxbot-common",
  "pulldown-cmark",
  "reqwest",
@@ -3669,7 +3663,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

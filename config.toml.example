@@ -2,6 +2,7 @@
 homeserver = "https://matrix.org"
 # Bot account credentials — create a separate account for this bot
 user_id = "@yourtranslatebot:matrix.org"
+# Secrets may instead come from MATRIX_ACCESS_TOKEN / MATRIX_RECOVERY_KEY.
 access_token = "YOUR_ACCESS_TOKEN"
 # Optional: security key from Element's "Set up Secure Backup"
 # Needed once to self-sign the bot's device (removes "not verified by owner" warning).
@@ -82,8 +83,9 @@ min_confidence = 0.5
 # silent_messages = true
 
 [security]
-# Users allowed to issue !reset-trust @user:server commands.
-# Only these users can allow someone to re-verify after their first verification.
+# Users allowed to run admin commands — in shared rooms and privately in a
+# direct chat with the bot (send !admin there for help).
+# They can let someone re-verify with !reset-trust @user:server.
 # Administrators can also start a room-independent verification with:
 # !verify-device @user:server DEVICE_ID
 # Admins can also run diagnostics from any room the bot is in:
@@ -94,8 +96,8 @@ min_confidence = 0.5
 #   !translate version         crate version + git commit the running binary was built from
 admin_users = ["@you:matrix.org"]
 
-# Only these users may invite the bot to a room.
-# If empty, the bot accepts invites from everyone (not recommended).
+# Users allowed to invite the bot ("all" = anyone, [] = nobody).
+# Configured admins may always open a direct chat with the bot.
 allowed_inviters = ["@you:matrix.org"]
 
 # Which devices receive room keys. Options:
@@ -114,3 +116,14 @@ allow_users_from_joined_rooms = false
 flow_timeout_secs = 300
 grant_ttl_secs = 600
 max_concurrent = 8
+
+[security.admin_dm]
+# Admins can open a direct chat with the bot and manage it there:
+#   !admin status | verify | settings | set <key> <value> | unset <key>
+# `!admin verify` starts mutual emoji (SAS) verification with you.
+enabled = true
+# Only accept admin commands in end-to-end encrypted direct chats.
+require_encryption = true
+# Only accept admin commands from devices the bot has verified (recommended
+# once you and the bot have verified each other).
+require_verified_device = false

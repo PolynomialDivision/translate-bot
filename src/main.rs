@@ -3,9 +3,8 @@
 mod db;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     future::Future,
-    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
@@ -14,8 +13,11 @@ use std::{
 };
 
 use mxbot_common::{
+    admin::Dispatch,
     config::{MatrixConfig, SecurityConfig},
-    verify::{VerificationService, VerificationSettings},
+    matrix_sdk,
+    send::send_with_retry,
+    Bot,
 };
 
 use db::{Db, DbEventOutcome};
@@ -45,14 +47,12 @@ fn flag_for_lang(lang: &str) -> &'static str {
 use anyhow::{Context, Result};
 use futures_util::future::join_all;
 use matrix_sdk::{
-    config::SyncSettings,
+    deserialized_responses::EncryptionInfo,
     ruma::{
-        api::client::filter::FilterDefinition,
         events::{
             relation::{InReplyTo, Replacement, Reply, Thread},
             room::{
                 encrypted::OriginalSyncRoomEncryptedEvent,
-                member::StrippedRoomMemberEvent,
                 message::{
                     MessageFormat, MessageType, NoticeMessageEventContent,
                     OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
@@ -61,9 +61,9 @@ use matrix_sdk::{
                 redaction::OriginalSyncRoomRedactionEvent,
             },
         },
-        OwnedEventId, OwnedServerName, OwnedUserId, RoomOrAliasId,
+        OwnedEventId,
     },
-    Client, Room, RoomState,
+    Room, RoomState,
 };
 use pulldown_cmark::html::push_html;
 use pulldown_cmark::{Options, Parser};
@@ -82,17 +82,6 @@ use tracing::{error, info, warn};
 const MAX_TRANSLATION_ABSOLUTE_CHARS: usize = 3 * DEFAULT_MAX_INPUT_CHARS;
 const MAX_TRANSLATION_EXPANSION_FACTOR: usize = 6;
 const MAX_TRANSLATION_EXPANSION_SLACK: usize = 80;
-
-fn parse_verify_device_arguments(
-    arguments: &str,
-) -> std::result::Result<(OwnedUserId, matrix_sdk::ruma::OwnedDeviceId), &'static str> {
-    let mut parts = arguments.split_whitespace();
-    let (Some(user), Some(device), None) = (parts.next(), parts.next(), parts.next()) else {
-        return Err("expected exactly a Matrix user ID and device ID");
-    };
-    let user_id = user.parse().map_err(|_| "invalid Matrix user ID")?;
-    Ok((user_id, matrix_sdk::ruma::OwnedDeviceId::from(device)))
-}
 
 #[derive(Deserialize)]
 struct Config {
@@ -588,10 +577,7 @@ struct BotState {
     translation: TranslationConfig,
     room_translations: HashMap<String, RoomTranslationConfig>,
     http: reqwest::Client,
-    bot_user_id: OwnedUserId,
-    admin_users: HashSet<OwnedUserId>,
-    allowed_inviters: HashSet<OwnedUserId>,
-    verification: VerificationService,
+    bot: Bot,
     startup_time: SystemTime,
     // Caps concurrent in-flight message handlers to bound task/connection growth.
     inflight: Arc<Semaphore>,
@@ -970,32 +956,12 @@ fn build_translation_bodies(lines: &[TranslatedLine]) -> (String, String) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // matrix-sdk instruments its own sync/event-handler internals at INFO and
-    // captures large Debug-formatted fields (the entire SyncSettings /
-    // FilterDefinition) on every span — left unfiltered, that dwarfs our own
-    // logs and burns through the container's log rotation budget within
-    // hours, evicting the history needed to debug past events. RUST_LOG, if
-    // set, still overrides this entirely.
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
-            |_| {
-                tracing_subscriber::EnvFilter::new(
-                    "info,matrix_sdk=warn,matrix_sdk_crypto=warn,matrix_sdk_base=warn,matrix_sdk_ui=warn",
-                )
-            },
-        ))
-        .init();
+    mxbot_common::logging::init("translate_bot");
 
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "config.toml".to_owned());
-    let config_str = fs::read_to_string(&config_path)
-        .await
-        .unwrap_or_else(|_| std::fs::read_to_string("config.toml").expect("config.toml not found"));
-    let config: Config = toml::from_str(&config_str)?;
+    let config: Config =
+        mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
 
-    let store_path =
-        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
+    let store_path = mxbot_common::config::store_path_from_env();
     fs::create_dir_all(&store_path).await?;
     // Sibling file next to matrix-sdk's own store (matrix-sdk-*.sqlite3) —
     // same directory, same volume, distinct name, no shared schema. Holds
@@ -1003,80 +969,19 @@ async fn main() -> Result<()> {
     // both of which need to survive process/container restarts.
     let db = Db::open(&store_path.join("translate-bot.sqlite3"))
         .context("Failed to open translate-bot database")?;
-    let (client, user_id) = mxbot_common::session::build_and_restore(
-        &config.matrix,
-        &store_path,
-        config.security.encryption_strategy.into(),
-    )
-    .await?;
 
-    let admin_users: HashSet<OwnedUserId> = config
-        .security
-        .admin_users
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    let allowed_inviters: HashSet<OwnedUserId> = config
-        .security
-        .allowed_inviters
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    let mut verification_users: HashSet<OwnedUserId> = config
-        .security
-        .verification
-        .allowed_users
-        .iter()
-        .filter_map(|user| user.parse().ok())
-        .collect();
-    if verification_users.is_empty() {
-        verification_users.clone_from(&allowed_inviters);
-    }
-
-    if admin_users.is_empty() {
-        warn!("No admin_users configured — !reset-trust command is disabled");
-    } else {
-        info!("Admin users: {:?}", admin_users);
-    }
-
-    if allowed_inviters.is_empty() {
-        warn!("No allowed_inviters configured — bot will accept invites from anyone");
-    } else {
-        info!("Allowed inviters: {:?}", allowed_inviters);
-    }
-
-    if verification_users.is_empty() {
-        warn!("No verification users configured — verification requests will require an administrative grant");
-    } else {
-        info!(
-            "Users allowed to verify with the bot: {:?}",
-            verification_users
-        );
-    }
+    // Installs verification, invite and admin-console handling before the
+    // first sync, so pending verification requests are not discarded.
+    let bot = Bot::builder("translate-bot", env!("CARGO_PKG_VERSION"))
+        .store_path(&store_path)
+        .admin_help("!translate status | stats | debug <event-id> | retry <event-id> | version")
+        .start(&config.matrix, &config.security)
+        .await?;
 
     let backend_concurrency = config.translation.backend_concurrency.max(1);
     // Hard cap for any backend HTTP call; must never cut off a translation
     // that is still within the configured request_timeout_secs.
     let http_timeout = Duration::from_secs(config.translation.request_timeout_secs.max(300) + 30);
-
-    let verification = VerificationService::allowlisted_tofu(
-        client.clone(),
-        verification_users,
-        VerificationSettings {
-            flow_timeout: Duration::from_secs(
-                config.security.verification.flow_timeout_secs.max(1),
-            ),
-            grant_ttl: Duration::from_secs(config.security.verification.grant_ttl_secs.max(1)),
-            max_concurrent: config.security.verification.max_concurrent.max(1),
-            allow_users_from_joined_rooms: config
-                .security
-                .verification
-                .allow_users_from_joined_rooms,
-        },
-    );
-    verification.install_handlers();
 
     let mut state = BotState {
         lt_url: config.libretranslate.url.trim_end_matches('/').to_owned(),
@@ -1093,10 +998,7 @@ async fn main() -> Result<()> {
             .timeout(http_timeout)
             .build()
             .expect("failed to build HTTP client"),
-        bot_user_id: user_id,
-        admin_users,
-        allowed_inviters,
-        verification,
+        bot: bot.clone(),
         inflight: Arc::new(Semaphore::new(8)),
         lt_requests: Arc::new(Semaphore::new(backend_concurrency)),
         stats: Arc::new(Stats::new(db.clone())),
@@ -1141,52 +1043,9 @@ async fn main() -> Result<()> {
     }
 
     // Advance the sync token past ordinary workload events from downtime before
-    // registering those handlers. Verification handlers are already installed
-    // so pending to-device and in-room verification requests are not discarded.
-    let filter = FilterDefinition::with_lazy_loading();
+    // registering those handlers (also joins invites received while offline).
     info!("Starting sync...");
-    client
-        .sync_once(SyncSettings::default().filter(filter.clone().into()))
-        .await?;
-
-    // Drain pending invites from prior sessions (StrippedRoomMemberEvent only fires for new
-    // invites, not ones already persisted in the SQLite store).
-    let invited = client.invited_rooms();
-    if !invited.is_empty() {
-        info!(
-            "Pending invite(s) found after initial sync — joining {} room(s)",
-            invited.len()
-        );
-        for room in invited {
-            let room_id = room.room_id().to_owned();
-            let inviter = match room.invite_details().await {
-                Ok(details) => details.inviter_id,
-                Err(error) => {
-                    warn!("Could not determine inviter for pending invite {room_id}: {error}");
-                    room.leave().await.ok();
-                    continue;
-                }
-            };
-            if !state.allowed_inviters.is_empty() && !state.allowed_inviters.contains(&inviter) {
-                warn!("Rejecting pending invite from {inviter} to {room_id}");
-                room.leave().await.ok();
-                continue;
-            }
-            let via: Vec<OwnedServerName> = room_id
-                .server_name()
-                .map(|s| vec![s.to_owned()])
-                .unwrap_or_default();
-            match RoomOrAliasId::parse(room_id.as_str()) {
-                Ok(room_or_alias) => {
-                    match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                        Ok(_) => info!("Joined pending invite room {room_id}"),
-                        Err(e) => warn!("Failed to join pending invite room {room_id}: {e}"),
-                    }
-                }
-                Err(e) => warn!("Invalid room ID in pending invite {room_id}: {e}"),
-            }
-        }
-    }
+    bot.initial_sync().await;
 
     // Recompute the backlog cutoff now, right before handlers that act on it
     // are registered. sync_once (the primary backlog defence) has already
@@ -1196,69 +1055,11 @@ async fn main() -> Result<()> {
     // messages merely older than process start.
     state.startup_time = SystemTime::now();
 
-    // Auto-join invited rooms (only from allowed_inviters)
-    client.add_event_handler({
-        let state = state.clone();
-        move |ev: StrippedRoomMemberEvent, room: Room, client: Client| {
-            let state = state.clone();
-            async move {
-                if ev.state_key != state.bot_user_id {
-                    return;
-                }
-                if !state.allowed_inviters.is_empty() && !state.allowed_inviters.contains(&ev.sender) {
-                    warn!("Rejecting invite from {} (not in allowed_inviters)", ev.sender);
-                    room.leave().await.ok();
-                    return;
-                }
-                info!("Accepted invite from {} to {}", ev.sender, room.room_id());
-                let room_id = room.room_id().to_owned();
-                let mut via: Vec<OwnedServerName> = vec![ev.sender.server_name().to_owned()];
-                if let Some(s) = room_id.server_name() {
-                    let s = s.to_owned();
-                    if !via.contains(&s) {
-                        via.push(s);
-                    }
-                }
-                let room_or_alias = match RoomOrAliasId::parse(room_id.as_str()) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        error!("Invalid room ID {room_id}: {e}");
-                        return;
-                    }
-                };
-                tokio::spawn(async move {
-                    let mut delay = 2u64;
-                    const MAX_ATTEMPTS: u32 = 8;
-                    for attempt in 1..=MAX_ATTEMPTS {
-                        match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                            Ok(_) => {
-                                info!("Joined {room_id}");
-                                return;
-                            }
-                            Err(ref e) if mxbot_common::verify::is_join_terminal(e) => {
-                                warn!("Join failed (terminal) for {room_id}: {e}");
-                                return;
-                            }
-                            Err(e) if attempt == MAX_ATTEMPTS => {
-                                warn!("Join failed after {MAX_ATTEMPTS} attempts for {room_id}: {e}");
-                            }
-                            Err(e) => {
-                                warn!("Join attempt {attempt}/{MAX_ATTEMPTS} failed for {room_id}: {e}; retry in {delay}s");
-                                sleep(Duration::from_secs(delay)).await;
-                                delay = (delay * 2).min(300);
-                            }
-                        }
-                    }
-                });
-            }
-        }
-    });
-
     // In-room messages: admin commands and translation. Verification requests
     // are consumed by mxbot-common's transport-independent handlers.
-    client.add_event_handler({
+    bot.client.add_event_handler({
         let state = state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
+        move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
             let state = state.clone();
             async move {
                 info!(
@@ -1272,7 +1073,19 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                if ev.sender == state.bot_user_id {
+                if ev.sender == state.bot.user_id {
+                    return;
+                }
+
+                // Shared admin console (verification, settings, status).
+                if room.state() == RoomState::Joined
+                    && state
+                        .bot
+                        .admin
+                        .handle(&room, &ev, encryption.as_ref())
+                        .await
+                        == Dispatch::Handled
+                {
                     return;
                 }
 
@@ -1318,12 +1131,12 @@ async fn main() -> Result<()> {
     // but that does not re-invoke event handlers, so a late key does not
     // retroactively translate the message — the room key needs to already be
     // available at sync time.
-    client.add_event_handler({
+    bot.client.add_event_handler({
         let state = state.clone();
         move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
             let state = state.clone();
             async move {
-                if ev.sender == state.bot_user_id {
+                if ev.sender == state.bot.user_id {
                     return;
                 }
                 warn!(
@@ -1352,7 +1165,7 @@ async fn main() -> Result<()> {
     // run inline: `handle_redaction` can wait up to `PENDING_TRANSLATION_WAIT`
     // for a same-event translation still in flight, and that must not block
     // the sync loop from dispatching the rest of this (or the next) batch.
-    client.add_event_handler({
+    bot.client.add_event_handler({
         let state = state.clone();
         move |ev: OriginalSyncRoomRedactionEvent, room: Room| {
             let state = state.clone();
@@ -1371,42 +1184,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    // client.sync() already retries transient network errors internally
-    // without returning; reaching the bottom of this loop means it gave up
-    // entirely (e.g. the homeserver is down for an extended period), so this
-    // outer retry backs off exponentially instead of hammering it every 5s —
-    // capped, and reset once a session has clearly been healthy again.
-    let mut sync_retry_backoff = SYNC_RETRY_INITIAL;
-    loop {
-        let attempt_started = Instant::now();
-        match client
-            .sync(SyncSettings::default().filter(filter.clone().into()))
-            .await
-        {
-            Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
-            Err(e) => warn!("Sync loop error: {e} — reconnecting in {sync_retry_backoff:?}"),
-        }
-        state.stats.sync_reconnects.fetch_add(1, Ordering::Relaxed);
-        let healthy = attempt_started.elapsed() >= SYNC_HEALTHY_AFTER;
-        let delay = sync_retry_delay(sync_retry_backoff, healthy);
-        sleep(delay).await;
-        sync_retry_backoff = (delay * 2).min(SYNC_RETRY_MAX);
-    }
-}
-
-const SYNC_RETRY_INITIAL: Duration = Duration::from_secs(5);
-const SYNC_RETRY_MAX: Duration = Duration::from_secs(300);
-const SYNC_HEALTHY_AFTER: Duration = Duration::from_secs(60);
-
-/// Backoff for the outer sync-reconnect loop: reset to the floor after a
-/// session that ran long enough to count as healthy, otherwise keep the
-/// current backoff (the caller doubles it, capped, for the round after).
-fn sync_retry_delay(previous_backoff: Duration, attempt_was_healthy: bool) -> Duration {
-    if attempt_was_healthy {
-        SYNC_RETRY_INITIAL
-    } else {
-        previous_backoff
-    }
+    let stats = Arc::clone(&state.stats);
+    bot.sync_forever_with(move || {
+        stats.sync_reconnects.fetch_add(1, Ordering::Relaxed);
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -2525,16 +2307,6 @@ max_concurrent = 4
         assert_eq!(defaults.verification.max_concurrent, 8);
     }
 
-    #[test]
-    fn verify_device_command_arguments_are_strict() {
-        let (user, device) = parse_verify_device_arguments("@alice:example.org DEVICE").unwrap();
-        assert_eq!(user.as_str(), "@alice:example.org");
-        assert_eq!(device.as_str(), "DEVICE");
-        assert!(parse_verify_device_arguments("@alice:example.org").is_err());
-        assert!(parse_verify_device_arguments("not-a-user DEVICE").is_err());
-        assert!(parse_verify_device_arguments("@alice:example.org DEVICE extra").is_err());
-    }
-
     // ── Exact serialized Matrix event JSON ────────────────────────────────────
     //
     // These tests serialize actual RoomMessageEventContent values and assert
@@ -2697,34 +2469,6 @@ max_concurrent = 4
             json.get("m.relates_to").is_none(),
             "caption with reply_to_original=false must produce no relation"
         );
-    }
-
-    // ── sync_retry_delay ─────────────────────────────────────────────────
-
-    #[test]
-    fn sync_retry_delay_holds_backoff_when_unhealthy() {
-        assert_eq!(
-            sync_retry_delay(Duration::from_secs(80), false),
-            Duration::from_secs(80)
-        );
-    }
-
-    #[test]
-    fn sync_retry_delay_resets_to_floor_when_healthy() {
-        assert_eq!(
-            sync_retry_delay(Duration::from_secs(300), true),
-            SYNC_RETRY_INITIAL
-        );
-    }
-
-    #[test]
-    fn sync_retry_backoff_doubles_and_caps() {
-        let mut backoff = SYNC_RETRY_INITIAL;
-        for _ in 0..20 {
-            let delay = sync_retry_delay(backoff, false);
-            backoff = (delay * 2).min(SYNC_RETRY_MAX);
-        }
-        assert_eq!(backoff, SYNC_RETRY_MAX);
     }
 
     // ── lookup_translation_awaiting_pending / mark_pending ──────────────────
@@ -3263,95 +3007,6 @@ fn make_relation(
     }
 }
 
-/// Sends a translation with a few retries on transient failure (brief
-/// homeserver hiccup, 429 rate limit, ...), mirroring the retry/backoff
-/// policy already used for the translation backend itself. Without this, a
-/// translation that succeeded but hit a transient send error was simply
-/// lost — silently, with no retry — even though the expensive part (getting
-/// the translation) had already succeeded. Uses the same generic backoff
-/// helper the rest of the mxbot fleet uses for its join-room retry loop.
-const MATRIX_SEND_MAX_ATTEMPTS: u32 = 4;
-const MATRIX_SEND_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
-const MATRIX_SEND_MAX_BACKOFF: Duration = Duration::from_secs(30);
-
-/// Classifies a Matrix send failure as retryable or permanent, and extracts
-/// any server-suggested retry delay (`M_LIMIT_EXCEEDED`'s `retry_after`).
-/// Mirrors `TranslationError::is_transient()`'s split for the backend: a
-/// clearly permanent error (forbidden, not-in-room, malformed request, ...)
-/// is not worth retrying for ~30s before failing anyway, and a 429 should
-/// wait exactly as long as the server asked rather than guessing.
-fn classify_send_error(error: &matrix_sdk::Error) -> (bool, Option<Duration>) {
-    let matrix_sdk::Error::Http(http_error) = error else {
-        // Non-HTTP errors (serialization, crypto/store errors, ...) aren't
-        // known to be transient — don't retry them.
-        return (false, None);
-    };
-    let Some(api_error) = http_error.as_client_api_error() else {
-        // No parseable Matrix error body (e.g. a raw connection/timeout
-        // error that never reached the server) — treat as transient.
-        return (true, None);
-    };
-    let retry_after = api_error.error_kind().and_then(|kind| match kind {
-        matrix_sdk::ruma::api::error::ErrorKind::LimitExceeded(data) => {
-            data.retry_after.as_ref().and_then(|r| match r {
-                matrix_sdk::ruma::api::error::RetryAfter::Delay(d) => Some(*d),
-                matrix_sdk::ruma::api::error::RetryAfter::DateTime(t) => {
-                    t.duration_since(SystemTime::now()).ok()
-                }
-            })
-        }
-        _ => None,
-    });
-    let status = api_error.status_code.as_u16();
-    (status == 429 || status >= 500, retry_after)
-}
-
-/// Sends a translation with a few retries on transient failure (brief
-/// homeserver hiccup, 429 rate limit, 5xx), mirroring the retry/backoff
-/// policy already used for the translation backend itself. Without this, a
-/// translation that succeeded but hit a transient send error was simply
-/// lost — silently, with no retry — even though the expensive part (getting
-/// the translation) had already succeeded. Bounded to
-/// `MATRIX_SEND_MAX_ATTEMPTS`: a homeserver outage delays in-flight sends,
-/// it does not queue an unbounded, ever-growing backlog of retries, since
-/// each call is one bounded loop awaited directly by its caller (itself
-/// already serialized behind the `inflight`/`lt_requests` semaphores).
-///
-/// All attempts reuse the *same* transaction ID (fixed once, before the
-/// loop): the Matrix C-S API guarantees `PUT .../send/{eventType}/{txnId}` is
-/// idempotent per-txn-id, so if an earlier attempt's request actually reached
-/// the homeserver and was processed — just the *response* was lost to a
-/// timeout or connection reset, which `classify_send_error` cannot tell apart
-/// from a request that never arrived — a retry is answered with the original
-/// event instead of creating a duplicate translation message.
-async fn send_with_retry(
-    room: &Room,
-    event_id: &OwnedEventId,
-    content: RoomMessageEventContent,
-) -> Result<OwnedEventId, matrix_sdk::Error> {
-    let mut backoff = MATRIX_SEND_INITIAL_BACKOFF;
-    let txn_id = matrix_sdk::ruma::TransactionId::new();
-    for attempt in 1..=MATRIX_SEND_MAX_ATTEMPTS {
-        match room.send(content.clone()).with_transaction_id(txn_id.clone()).await {
-            Ok(resp) => return Ok(resp.response.event_id),
-            Err(e) => {
-                let (retryable, retry_after) = classify_send_error(&e);
-                if !retryable || attempt == MATRIX_SEND_MAX_ATTEMPTS {
-                    return Err(e);
-                }
-                let delay = retry_after.unwrap_or(backoff).min(MATRIX_SEND_MAX_BACKOFF);
-                warn!(
-                    "Matrix send for {event_id} failed transiently \
-                     attempt={attempt}/{MATRIX_SEND_MAX_ATTEMPTS}: {e} — retrying in {delay:?}"
-                );
-                sleep(delay).await;
-                backoff = backoff.saturating_mul(2).min(MATRIX_SEND_MAX_BACKOFF);
-            }
-        }
-    }
-    unreachable!("loop above always returns on its final iteration")
-}
-
 /// How long an edit or redaction will wait for a same-event translation that
 /// is still in flight (detection + translation + Matrix send can take a few
 /// seconds, longer under retries) before giving up and treating the event as
@@ -3637,7 +3292,7 @@ async fn handle_media_caption(
         in_thread,
     );
 
-    let send_result = send_with_retry(&room, &event.event_id, content).await;
+    let send_result = send_with_retry(&room, content).await;
     record_translated(
         &state,
         &event.event_id,
@@ -3911,7 +3566,10 @@ async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoo
             return;
         }
         Ok(None) => {}
-        Err(e) => warn!("Failed to check existing translation for {}: {e}", event.event_id),
+        Err(e) => warn!(
+            "Failed to check existing translation for {}: {e}",
+            event.event_id
+        ),
     }
 
     // From here on this event might end up translated — mark it "pending" so
@@ -3986,65 +3644,10 @@ async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoo
 
     // Admin commands only apply to genuine m.text — not m.emote.
     if is_command_eligible {
-        // Admin command: initiate a to-device verification without requiring the
-        // target user to have permission to send room messages.
-        if let Some(arguments) = raw.strip_prefix("!verify-device ") {
-            if !state.admin_users.contains(&event.sender) {
-                warn!("!verify-device from non-admin {} — ignored", event.sender);
-                return;
-            }
-
-            let (target_user, target_device) = match parse_verify_device_arguments(arguments) {
-                Ok(target) => target,
-                Err(error) => {
-                    warn!("!verify-device: {error}");
-                    return;
-                }
-            };
-            state
-                .verification
-                .grant_device(target_user.clone(), target_device.clone())
-                .await;
-            match state
-                .verification
-                .request_device_verification(&target_user, &target_device)
-                .await
-            {
-                Ok(()) => info!(
-                    "Started administrator-approved to-device verification for {} {}",
-                    target_user, target_device
-                ),
-                Err(error) => warn!(
-                    "Could not start to-device verification for {} {}: {}",
-                    target_user, target_device, error
-                ),
-            }
-            return;
-        }
-
-        // Admin command: !reset-trust @user:server
-        if let Some(target) = raw.strip_prefix("!reset-trust ") {
-            if state.admin_users.contains(&event.sender) {
-                match target.trim().parse::<OwnedUserId>() {
-                    Ok(target_user) => {
-                        state.verification.grant_user(target_user.clone()).await;
-                        info!(
-                            "Trust reset allowed for {} (by {})",
-                            target_user, event.sender
-                        );
-                    }
-                    Err(_) => warn!("!reset-trust: invalid user ID '{}'", target.trim()),
-                }
-            } else {
-                warn!("!reset-trust from non-admin {} — ignored", event.sender);
-            }
-            return;
-        }
-
         // Admin command family: !translate status | stats | debug <event-id>
         // | retry <event-id> | version
         if raw == "!translate" || raw.starts_with("!translate ") {
-            if !state.admin_users.contains(&event.sender) {
+            if !state.bot.is_admin(&event.sender) {
                 warn!("!translate from non-admin {} — ignored", event.sender);
                 return;
             }
@@ -4183,7 +3786,7 @@ async fn handle_message_core(state: BotState, room: Room, event: OriginalSyncRoo
         in_thread,
     );
 
-    let send_result = send_with_retry(&room, &event.event_id, content).await;
+    let send_result = send_with_retry(&room, content).await;
     record_translated(
         &state,
         &event.event_id,
@@ -4443,7 +4046,7 @@ async fn handle_edit(
     )));
 
     info!("Editing bot translation {bot_event_id} for edit of {original_event_id}");
-    let send_result = send_with_retry(&room, &original_event_id, edit_content).await;
+    let send_result = send_with_retry(&room, edit_content).await;
     record_translated(
         &state,
         &original_event_id,
