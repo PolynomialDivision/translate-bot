@@ -1,8 +1,15 @@
-# Credentials
+# Credentials — mounted at runtime, never part of the image
 config.toml
+config.*.toml
+.env
+access
+keys/
 
 # Runtime data
 store/
 
-# Pre-built binary artifacts (not needed, we build inside Docker now)
+# Build and tooling leftovers
 target/
+.venv/
+.build-logs/
+# .git/ is kept: build.rs embeds the commit hash (!translate version)
