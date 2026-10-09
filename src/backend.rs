@@ -239,7 +239,7 @@ impl BotState {
                 // 2xx response that fails to parse as {"translatedText":...}
                 // is exactly the shape most likely to contain the translated
                 // user content itself (truncated/malformed JSON, but the
-                // text is still in there) — log the parse error and size
+                // text is still in there): log the parse error and size
                 // only, never the body, so translated content never reaches
                 // logs.
                 Err(e) => Err(TranslationError::new(
@@ -289,7 +289,7 @@ pub(crate) fn is_backend_busy_body(body: &str) -> bool {
 /// confidence on a 0-100 scale, but `min_confidence` is documented and
 /// configured on a 0.0-1.0 scale. Without this conversion, `min_confidence`
 /// compares against the wrong scale and only ever rejects a confidence of
-/// exactly 0 — the threshold silently stops filtering anything.
+/// exactly 0. The threshold silently stops filtering anything.
 pub(crate) fn normalize_confidence(raw: f64) -> f64 {
     (raw / 100.0).clamp(0.0, 1.0)
 }
@@ -333,7 +333,7 @@ where
             }
             Err(error) if attempts < policy.max_attempts && error.is_transient() => {
                 warn!(
-                    "Translation target={target} failed transiently attempt={attempts}/{} class={} detail={} — retrying",
+                    "Translation target={target} failed transiently attempt={attempts}/{} class={} detail={}: retrying",
                     policy.max_attempts,
                     error.class(),
                     error.detail

@@ -127,7 +127,7 @@ pub(crate) async fn translate_html_target_with_retry(
         Ok(line) => Ok(line),
         Err(html_failure) => {
             warn!(
-                "HTML translation target={} failed after {} attempts class={} detail={} — falling back to text",
+                "HTML translation target={} failed after {} attempts class={} detail={}: falling back to text",
                 html_failure.target,
                 html_failure.attempts,
                 html_failure.error.class(),
@@ -139,7 +139,7 @@ pub(crate) async fn translate_html_target_with_retry(
 }
 
 /// Decide whether a detected message should be translated and, if so, into
-/// which target languages. Every rejection path logs its specific reason —
+/// which target languages. Every rejection path logs its specific reason,
 /// without this, a message skipped here leaves no trace in the logs, making
 /// it indistinguishable from a message that was never received at all.
 pub(crate) fn resolve_translation_targets(

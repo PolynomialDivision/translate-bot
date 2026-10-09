@@ -3,7 +3,7 @@
 use super::*;
 
 /// Why an event was not translated. The `&'static str` form is what actually
-/// appears in logs/stats/diagnostics — kept as an enum so call sites can't
+/// appears in logs/stats/diagnostics: kept as an enum so call sites can't
 /// typo a reason string that then silently fails to aggregate correctly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SkipReason {
@@ -48,7 +48,7 @@ impl SkipReason {
 
 /// A snapshot of what happened to one Matrix event, kept in a bounded
 /// ring buffer so `!translate debug <event-id>` can explain recent history
-/// without needing a persistent store. Not a substitute for logs — just an
+/// without needing a persistent store. Not a substitute for logs, just an
 /// index into "what do I check first."
 #[derive(Clone)]
 pub(crate) struct EventOutcome {
@@ -91,8 +91,8 @@ impl From<&EventOutcome> for DbEventOutcome {
 
 pub(crate) const EVENT_OUTCOME_HISTORY: usize = 300;
 
-/// Process-lifetime counters and recent-event history. Reset on restart —
-/// this is in-memory diagnostics for "what's happening right now", not a
+/// Process-lifetime counters and recent-event history. Reset on restart.
+/// This is in-memory diagnostics for "what's happening right now", not a
 /// durable audit log (that's what stdout/docker logs are for).
 pub(crate) struct Stats {
     pub(crate) started_at: SystemTime,
@@ -136,7 +136,7 @@ impl Stats {
     /// Pushes into the in-memory ring buffer (fast path for the current
     /// process's lifetime) and, best-effort, persists the same outcome to
     /// the DB in the background so `!translate debug` can still find recent
-    /// failures after a restart. The DB write is fire-and-forget — this is
+    /// failures after a restart. The DB write is fire-and-forget. This is
     /// diagnostics, not the correctness-critical dedup path (that's
     /// `Db::record_translation`, which callers await directly).
     pub(crate) fn push_outcome(&self, outcome: EventOutcome) {
@@ -164,7 +164,7 @@ impl Stats {
             .cloned()
     }
 
-    /// Checks the in-memory ring buffer first, then falls back to the DB —
+    /// Checks the in-memory ring buffer first, then falls back to the DB:
     /// covers both "recent in this process" and "from before the last
     /// restart" lookups.
     pub(crate) async fn find_outcome(&self, event_id: &str) -> Option<DbEventOutcome> {
@@ -192,7 +192,7 @@ impl Stats {
 }
 
 /// Durably records that `original_event_id` was translated into
-/// `bot_event_id`, so a later edit or redaction — even after a restart —
+/// `bot_event_id`, so a later edit or redaction (even after a restart)
 /// can find and update/remove the bot's translation. Awaited synchronously
 /// (not fire-and-forget): this is the correctness-critical dedup path, so
 /// the write must complete before the caller considers the event handled.

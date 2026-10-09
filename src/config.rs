@@ -64,7 +64,7 @@ pub(crate) struct TranslationConfig {
     /// Maximum input length (message body or caption, in characters)
     /// submitted to the translation backend. The backend is a single,
     /// GPU-constrained, largely CPU-bound LLM shared across all rooms via a
-    /// small concurrency semaphore (`backend_concurrency`) — one very long
+    /// small concurrency semaphore (`backend_concurrency`): one very long
     /// message would otherwise hold a slot for a disproportionate amount of
     /// time and delay everyone else's translations. Ordinary chat messages
     /// are nowhere near the default.

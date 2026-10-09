@@ -1,6 +1,6 @@
 //! Durable state for translate-bot, kept in a sibling SQLite file next to
 //! matrix-sdk's own store (`matrix-sdk-{crypto,event-cache,media,state}.sqlite3`
-//! live directly in the same directory — this file is named distinctly and
+//! live directly in the same directory. This file is named distinctly and
 //! never touches their schema). Mirrors the `Db(Arc<Mutex<Connection>>)`
 //! pattern radar-bot already uses for its own `store/items.db`.
 //!
@@ -61,13 +61,13 @@ CREATE INDEX IF NOT EXISTS idx_event_outcomes_event_id ON event_outcomes(event_i
 /// mapping someone might still legitimately edit. Six months comfortably
 /// covers realistic edit/redaction activity.
 const TRANSLATIONS_MAX_AGE_SECS: i64 = 180 * 24 * 60 * 60;
-/// Backstop against unbounded growth (e.g. a much busier future deployment)
-/// — rows are a handful of short strings each, so even this is a few MB.
+/// Backstop against unbounded growth (e.g. a much busier future deployment):
+/// rows are a handful of short strings each, so even this is a few MB.
 /// Age-based pruning above is expected to keep the table far below this in
 /// practice; this only bites if it doesn't.
 const TRANSLATIONS_ROW_CAP: i64 = 100_000;
 
-/// Diagnostics only (see module docs), so a flat row cap is fine — nothing
+/// Diagnostics only (see module docs), so a flat row cap is fine. Nothing
 /// here is expected to be looked up long after the fact.
 pub(crate) const EVENT_OUTCOMES_RETENTION: i64 = 5_000;
 
@@ -112,12 +112,12 @@ impl Db {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        // Wait up to 5s instead of immediately returning SQLITE_BUSY — this
+        // Wait up to 5s instead of immediately returning SQLITE_BUSY. This
         // process is the only writer, but WAL readers can briefly overlap.
         conn.pragma_update(None, "busy_timeout", 5_000i64)?;
         // `CREATE TABLE/INDEX IF NOT EXISTS` is idempotent and safe to run
         // on every startup, but it does NOT add columns to a table that
-        // already exists from a previous version — a future release adding
+        // already exists from a previous version. A future release adding
         // a column must migrate it explicitly with `ensure_column` below
         // (ALTER TABLE ADD COLUMN), the same pattern radar-bot already uses
         // for its own store/items.db. Nothing needs it yet since this is a
@@ -129,8 +129,8 @@ impl Db {
 
     /// Records (or updates, if retried) that `original_event_id` was
     /// translated into `bot_event_id`. Prunes rows older than
-    /// `TRANSLATIONS_MAX_AGE_SECS`, then — only if that somehow wasn't
-    /// enough — the oldest rows beyond `TRANSLATIONS_ROW_CAP`.
+    /// `TRANSLATIONS_MAX_AGE_SECS`, then (only if that somehow wasn't
+    /// enough) the oldest rows beyond `TRANSLATIONS_ROW_CAP`.
     pub async fn record_translation(
         &self,
         original_event_id: &str,
@@ -278,7 +278,7 @@ impl Db {
 
 /// Adds `column` to `table` if it isn't already present. The migration hook
 /// for evolving this schema in a future release without losing existing
-/// data — `CREATE TABLE IF NOT EXISTS` alone only handles brand-new tables,
+/// data: `CREATE TABLE IF NOT EXISTS` alone only handles brand-new tables,
 /// not new columns on ones that already exist from a previous version. Same
 /// pattern as radar-bot's `db.rs`. Not called yet (nothing to migrate in a
 /// brand-new schema); kept ready and proven by the test below.
@@ -333,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn translations_retention_prunes_oldest() {
         let db = Db::open_in_memory().unwrap();
-        // Exceed the retention cap directly to keep the test fast — the
+        // Exceed the retention cap directly to keep the test fast. The
         // production cap (10k) would make this test slow.
         for i in 0..5 {
             db.record_translation(
@@ -392,7 +392,7 @@ mod tests {
             .await
             .unwrap();
         {
-            // Backdate directly — recording with `now_secs()` would never
+            // Backdate directly: recording with `now_secs()` would never
             // itself be old enough to trigger age-based pruning.
             let conn = db.0.lock().unwrap();
             conn.execute(

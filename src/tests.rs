@@ -186,7 +186,7 @@ async fn permanent_failure_is_not_retried_excessively() {
 
     assert_eq!(failure.attempts, 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    // Not transient — must not count as a retry attempt.
+    // Not transient: must not count as a retry attempt.
     assert_eq!(stats.retries.load(Ordering::Relaxed), 0);
     assert_eq!(stats.retries_succeeded.load(Ordering::Relaxed), 0);
 }
@@ -284,7 +284,7 @@ fn normalize_confidence_clamps_out_of_range_values() {
 fn normalize_confidence_low_value_correctly_fails_default_threshold() {
     // Reproduces the observed bug scenario: a short/ambiguous message
     // misdetected with low real-world confidence must fail the default
-    // min_confidence=0.5 threshold once normalized — pre-fix, 7.0 (raw)
+    // min_confidence=0.5 threshold once normalized: pre-fix, 7.0 (raw)
     // would have incorrectly cleared a 0.5 threshold.
     let default = TranslationConfig::default();
     assert!(normalize_confidence(7.0) < default.min_confidence);
@@ -593,7 +593,7 @@ fn make_translation_content_preserves_body() {
 // Covers the event that prompted this: an m.image with a real caption
 // ($6qLBtCRwYLUXpbr2zsyC-tAoaHSZUzz7kdksYQc09Ig, body "Hat jemand
 // Interesse an einer Couch?", filename "1000006546.jpg") turned out not
-// to be a msgtype-matching bug — these tests pin down the matching logic
+// to be a msgtype-matching bug. These tests pin down the matching logic
 // regardless.
 
 use matrix_sdk::ruma::{
@@ -648,7 +648,7 @@ fn media_caption_kind_image_filename_equal_to_body_has_no_caption() {
 #[test]
 fn media_caption_kind_image_without_filename_field_has_no_caption() {
     // Older/other clients may omit `filename` entirely and just send the
-    // filename as `body` — caption() requires filename to be set to
+    // filename as `body`: caption() requires filename to be set to
     // recognize body as a distinct caption, per the Matrix spec.
     let content = ImageMessageEventContent::plain("1000006546.jpg".into(), mxc());
     let msgtype = MessageType::Image(content);
@@ -658,7 +658,7 @@ fn media_caption_kind_image_without_filename_field_has_no_caption() {
 #[test]
 fn media_caption_kind_encrypted_image_caption_still_available() {
     // The media file being end-to-end encrypted (MediaSource::Encrypted)
-    // is orthogonal to whether a plaintext caption is present — by the
+    // is orthogonal to whether a plaintext caption is present: by the
     // time the bot's handler sees the event, room-level E2EE has already
     // been decrypted by matrix-sdk-crypto, and caption() only looks at
     // `body`/`filename`, never `source`.
@@ -718,7 +718,7 @@ fn media_caption_kind_unsupported_type_is_ignored() {
 
 // ── extract_edit_text tests ──────────────────────────────────────────────
 // Edits of captioned media arrive with the same media msgtype as the
-// original (not m.text) — these pin down that handle_edit can extract
+// original (not m.text). These pin down that handle_edit can extract
 // text from that shape too, not just m.text/m.emote.
 
 #[test]
@@ -1020,7 +1020,7 @@ reply_to_original = true"#;
 
 #[test]
 fn serde_reply_to_original_missing_key_defaults_to_true() {
-    // Key is absent — serde invokes the #[serde(default = "default_true")] path.
+    // Key is absent: serde invokes the #[serde(default = "default_true")] path.
     let toml = r#"langs = ["en", "de"]"#;
     let cfg: TranslationConfig = toml::from_str(toml).unwrap();
     assert!(
@@ -1139,7 +1139,7 @@ fn json_reply_shape() {
     //   "m.relates_to": {
     //     "m.in_reply_to": { "event_id": "$original:example.org" }
     //   }
-    // Note: no "rel_type" key — pure replies do not have rel_type per Matrix spec.
+    // Note: no "rel_type" key: pure replies do not have rel_type per Matrix spec.
     let json = content_with_relation(true, false);
     let rel = &json["m.relates_to"];
     assert!(!rel.is_null(), "m.relates_to must be present");
@@ -1165,7 +1165,7 @@ fn json_thread_shape() {
     //
     // Note: ruma omits is_falling_back from the JSON when it is false
     // (#[serde(skip_serializing_if = "is_default")]).  Per the Matrix spec,
-    // an absent is_falling_back is equivalent to false — a genuine thread
+    // an absent is_falling_back is equivalent to false. A genuine thread
     // reply.  is_falling_back only appears in the JSON when true (fallback).
     let json = content_with_relation(true, true);
     let rel = &json["m.relates_to"];
@@ -1346,7 +1346,7 @@ async fn lookup_translation_awaiting_pending_waits_for_in_flight_translation_to_
 #[tokio::test]
 async fn lookup_translation_awaiting_pending_returns_none_promptly_when_original_was_skipped() {
     // The original message finishes without ever calling
-    // record_translation (e.g. below_confidence) — the waiter must be
+    // record_translation (e.g. below_confidence). The waiter must be
     // woken immediately by the guard's drop, not sit out the full
     // PENDING_TRANSLATION_WAIT before concluding there's no mapping.
     let db = Db::open_in_memory().unwrap();

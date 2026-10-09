@@ -1,6 +1,6 @@
 [matrix]
 homeserver = "https://matrix.org"
-# Bot account credentials — create a separate account for this bot
+# Bot account credentials: create a separate account for this bot
 user_id = "@yourtranslatebot:matrix.org"
 # Secrets may instead come from MATRIX_ACCESS_TOKEN / MATRIX_RECOVERY_KEY.
 access_token = "YOUR_ACCESS_TOKEN"
@@ -12,7 +12,7 @@ recovery_key = "EsXX xxxx xxxx xxxx xxxx xxxx xxxx xxxx"
 device_id = "YOUR_DEVICE_ID"
 
 [libretranslate]
-# Option A: official public instance (free API key required — sign up at libretranslate.com)
+# Option A: official public instance (free API key required, sign up at libretranslate.com)
 url = "https://libretranslate.com"
 api_key = "YOUR_API_KEY"
 
@@ -83,7 +83,7 @@ min_confidence = 0.5
 # silent_messages = true
 
 [security]
-# Users allowed to run admin commands — in shared rooms and privately in a
+# Users allowed to run admin commands, privately in a
 # direct chat with the bot (send !admin there for help).
 # They can let someone re-verify with !reset-trust @user:server.
 # Administrators can also start a room-independent verification with:
@@ -101,9 +101,9 @@ admin_users = ["@you:matrix.org"]
 allowed_inviters = ["@you:matrix.org"]
 
 # Which devices receive room keys. Options:
-#   identity_based  — only devices cross-signed by their owner (default, recommended)
-#   only_trusted    — only explicitly verified devices
-#   all_devices     — all devices, no restriction
+#   identity_based: only devices cross-signed by their owner (default, recommended)
+#   only_trusted: only explicitly verified devices
+#   all_devices: all devices, no restriction
 encryption_strategy = "identity_based"
 
 [security.verification]

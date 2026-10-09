@@ -179,7 +179,7 @@ pub(crate) fn build_html_line(
 /// | true              | false     | false          | m.in_reply_to reply |
 /// | true              | false     | true           | m.thread            |
 ///
-/// `in_thread` — whether the original event is already inside a thread.
+/// `in_thread`: whether the original event is already inside a thread.
 ///   When true the bot always thread-replies into that same thread, regardless
 ///   of `thread_replies` config.  `thread_replies = false` only suppresses the
 ///   bot from *opening* new threads on standalone messages.

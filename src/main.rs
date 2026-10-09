@@ -83,7 +83,7 @@ struct BotState {
     lt_requests: Arc<Semaphore>,
     stats: Arc<Stats>,
     // Durable dedup (original event_id -> bot's translation event_id) and
-    // best-effort event-outcome history — survives process restarts.
+    // best-effort event-outcome history: survives process restarts.
     // See db.rs. Cheap to clone (Arc<Mutex<Connection>> internally).
     db: Db,
     // Marks original event IDs whose translate-and-persist pipeline is
@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
 
     let store_path = mxbot_common::config::store_path_from_env();
     fs::create_dir_all(&store_path).await?;
-    // Sibling file next to matrix-sdk's own store (matrix-sdk-*.sqlite3) —
+    // Sibling file next to matrix-sdk's own store (matrix-sdk-*.sqlite3):
     // same directory, same volume, distinct name, no shared schema. Holds
     // durable dedup (translations) and best-effort event-outcome history,
     // both of which need to survive process/container restarts.
@@ -114,7 +114,9 @@ async fn main() -> Result<()> {
     // first sync, so pending verification requests are not discarded.
     let bot = Bot::builder("translate-bot", env!("CARGO_PKG_VERSION"))
         .store_path(&store_path)
-        .admin_help("!translate status | stats | debug <event-id> | retry <event-id> | version")
+        .admin_help(
+            "🌍 !translate status · stats · version\n🔍 !translate debug <event-id>\n🔁 !translate retry <event-id>",
+        )
         .start(&config.matrix, &config.security)
         .await?;
 
@@ -128,7 +130,7 @@ async fn main() -> Result<()> {
         lt_api_key: config.libretranslate.api_key,
         translation: config.translation,
         room_translations: config.room_translations,
-        // Placeholder — the real cutoff is set below, once handlers are about
+        // Placeholder: the real cutoff is set below, once handlers are about
         // to be registered. It must not be captured this early: everything
         // above (session restore, the ltengine probe, sync_once itself) can
         // take several seconds, and a live message sent during that window
@@ -171,14 +173,14 @@ async fn main() -> Result<()> {
     match probe {
         Ok(resp) if resp.status().is_success() => info!("ltengine ready at startup"),
         Ok(resp) if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => warn!(
-            "ltengine reachable but its model is still loading — translations will be retried until it is ready"
+            "ltengine reachable but its model is still loading: translations will be retried until it is ready"
         ),
         Ok(resp) => warn!(
-            "ltengine returned {} at startup — translations may fail",
+            "ltengine returned {} at startup: translations may fail",
             resp.status()
         ),
         Err(e) => {
-            warn!("ltengine not reachable at startup: {e} — translations will fail until it is up")
+            warn!("ltengine not reachable at startup: {e}, translations will fail until it is up")
         }
     }
 
@@ -252,7 +254,7 @@ async fn main() -> Result<()> {
 
                 let inflight = Arc::clone(&state.inflight);
                 tokio::spawn(async move {
-                    // Acquire a slot before starting — bounds concurrent HTTP connections
+                    // Acquire a slot before starting: bounds concurrent HTTP connections
                     // to ltengine and prevents unbounded task accumulation when it is slow.
                     let _permit = inflight.acquire_owned().await;
                     handle_message(state, room, ev).await;
@@ -263,13 +265,13 @@ async fn main() -> Result<()> {
 
     // Events matrix-sdk-crypto could not decrypt stay shaped as m.room.encrypted
     // and are dispatched here instead of to the OriginalSyncRoomMessageEvent
-    // handler above (which only ever sees plaintext — the SDK recasts an event
+    // handler above (which only ever sees plaintext: the SDK recasts an event
     // to its plaintext type before dispatch, precisely when decryption
     // succeeded). Without this handler, undecryptable events were completely
     // invisible: no log, no counter, nothing. Known limitation: matrix-sdk can
     // later re-decrypt an event once a key arrives (see its `redecryptor`),
     // but that does not re-invoke event handlers, so a late key does not
-    // retroactively translate the message — the room key needs to already be
+    // retroactively translate the message. The room key needs to already be
     // available at sync time.
     bot.client.add_event_handler({
         let state = state.clone();
@@ -280,7 +282,7 @@ async fn main() -> Result<()> {
                     return;
                 }
                 warn!(
-                    "Unable to decrypt {} from {} in {} — translation skipped",
+                    "Unable to decrypt {} from {} in {}: translation skipped",
                     ev.event_id,
                     ev.sender,
                     room.room_id()
@@ -300,7 +302,7 @@ async fn main() -> Result<()> {
     });
 
     // Redactions: if a user deletes their original message, delete the bot's
-    // translation too — including thread replies that would otherwise be orphaned.
+    // translation too, including thread replies that would otherwise be orphaned.
     // Spawned (with the same inflight permit as regular messages) rather than
     // run inline: `handle_redaction` can wait up to `PENDING_TRANSLATION_WAIT`
     // for a same-event translation still in flight, and that must not block
@@ -312,7 +314,7 @@ async fn main() -> Result<()> {
             async move {
                 // `redacts` can be None in some room versions / federation edge cases.
                 let Some(redacted_id) = ev.redacts.clone() else {
-                    warn!("Redaction event has no `redacts` field — ignoring");
+                    warn!("Redaction event has no `redacts` field, ignoring");
                     return;
                 };
                 let inflight = Arc::clone(&state.inflight);

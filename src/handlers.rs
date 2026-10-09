@@ -9,9 +9,9 @@ use super::*;
 pub(crate) const PENDING_TRANSLATION_WAIT: Duration = Duration::from_secs(30);
 
 /// RAII marker that `event_id`'s translate-and-persist pipeline is running.
-/// A same-event edit or redaction that arrives before this finishes — a real
-/// race, since edits/redactions can land within milliseconds of the original
-/// — can wait on it via [`lookup_translation_awaiting_pending`] instead of
+/// A same-event edit or redaction that arrives before this finishes (a real
+/// race, since edits/redactions can land within milliseconds of the original)
+/// can wait on it via [`lookup_translation_awaiting_pending`] instead of
 /// concluding there is no translation to update/delete. Dropped on every
 /// exit path (success, skip, or early return) and wakes at most one waiter
 /// via `Notify::notify_one`, which stores its permit if nobody is waiting
@@ -57,7 +57,7 @@ pub(crate) async fn lookup_translation_awaiting_pending(
 ) -> Result<Option<String>> {
     // Snapshot the in-flight handle (if any) *before* re-checking the DB, so
     // a task that finishes between our first check and this one can't race
-    // us out of seeing its notification — notify_one() stores its permit if
+    // us out of seeing its notification: notify_one() stores its permit if
     // it fires before anyone is waiting yet.
     let notify = pending.lock().unwrap().get(original_event_id).cloned();
 
@@ -69,7 +69,7 @@ pub(crate) async fn lookup_translation_awaiting_pending(
     };
     info!(
         "Edit/redaction for {original_event_id} arrived while its translation was still in \
-         flight — waiting up to {PENDING_TRANSLATION_WAIT:?}"
+         flight: waiting up to {PENDING_TRANSLATION_WAIT:?}"
     );
     let _ = timeout(PENDING_TRANSLATION_WAIT, notify.notified()).await;
     db.lookup_translation(original_event_id).await
@@ -184,11 +184,11 @@ pub(crate) async fn handle_media_caption(
 }
 
 /// Returns `Some((kind, caption))` for a msgtype that has a caption slot
-/// (`m.image`, `m.video`, `m.audio`, `m.file`) — `caption` is `None` when the
+/// (`m.image`, `m.video`, `m.audio`, `m.file`): `caption` is `None` when the
 /// slot is present but unused (no `filename` set, or `body == filename`, per
 /// the Matrix media-caption spec: https://spec.matrix.org/v1.18/client-server-api/#media-captions).
 /// Returns `None` for msgtypes that have no caption slot at all (`m.text`,
-/// `m.location`, `m.emote`, etc.) — those are handled elsewhere or ignored.
+/// `m.location`, `m.emote`, etc.). Those are handled elsewhere or ignored.
 pub(crate) fn media_caption_kind(msgtype: &MessageType) -> Option<(&'static str, Option<&str>)> {
     match msgtype {
         MessageType::Image(m) => Some(("image", m.caption())),
@@ -211,7 +211,7 @@ pub(crate) async fn handle_message(
     // place; this check only catches whatever slips through that.
     //
     // This check lives here rather than in handle_message_core so that
-    // `!translate retry` — which necessarily reprocesses an old event — can
+    // `!translate retry` (which necessarily reprocesses an old event) can
     // call handle_message_core directly and bypass it.
     if let Some(event_time) = event.origin_server_ts.to_system_time() {
         if event_time < state.startup_time {
@@ -241,7 +241,7 @@ pub(crate) async fn handle_message_core(
     let room_id = room.room_id().as_str().to_owned();
     let sender = event.sender.as_str().to_owned();
 
-    // Edits arrive as m.replace — route them to handle_edit and stop.
+    // Edits arrive as m.replace: route them to handle_edit and stop.
     // Must be checked BEFORE the msgtype guard: the top-level body of an edit
     // is only a fallback ("* new text") for old clients and must NOT be translated.
     if let Some(Relation::Replacement(ref replacement)) = event.content.relates_to {
@@ -254,14 +254,14 @@ pub(crate) async fn handle_message_core(
     // Idempotency guard: if this event_id was already translated, don't do
     // it again. Normally unreachable (each event is only ever dispatched
     // once by matrix-sdk), but it's a cheap, indexed lookup that closes off
-    // a real failure mode — a process restart between sending the
+    // a real failure mode (a process restart between sending the
     // translation and the SDK's since-token being persisted, or `!translate
-    // retry` racing a live delivery of the same event — from ever producing
+    // retry` racing a live delivery of the same event) from ever producing
     // a second translation of the same message.
     match state.db.lookup_translation(event.event_id.as_str()).await {
         Ok(Some(existing)) => {
             info!(
-                "{} was already translated as {existing} — skipping duplicate delivery",
+                "{} was already translated as {existing}: skipping duplicate delivery",
                 event.event_id
             );
             record_skip(
@@ -282,7 +282,7 @@ pub(crate) async fn handle_message_core(
         ),
     }
 
-    // From here on this event might end up translated — mark it "pending" so
+    // From here on this event might end up translated: mark it "pending" so
     // a same-event edit/redaction that races in before we're done (or before
     // we decide to skip) waits for us instead of concluding there's no
     // mapping. Held for the rest of this function, across every await below.
@@ -290,7 +290,7 @@ pub(crate) async fn handle_message_core(
 
     // Media messages can carry a user-written caption in `body`. Per the
     // Matrix media-caption spec, `caption()` only returns it when `body`
-    // differs from `filename` — a bare filename (e.g. "1000006546.jpg") is
+    // differs from `filename`. A bare filename (e.g. "1000006546.jpg") is
     // never mistaken for a caption.
     if let Some((kind, caption)) = media_caption_kind(&event.content.msgtype) {
         let caption = caption
@@ -352,13 +352,13 @@ pub(crate) async fn handle_message_core(
     let is_command_eligible = matches!(event.content.msgtype, MessageType::Text(_));
     let raw = raw.trim();
 
-    // Admin commands only apply to genuine m.text — not m.emote.
+    // Admin commands only apply to genuine m.text, not m.emote.
     if is_command_eligible {
         // Admin command family: !translate status | stats | debug <event-id>
         // | retry <event-id> | version
         if raw == "!translate" || raw.starts_with("!translate ") {
             if !state.bot.is_admin(&event.sender) {
-                warn!("!translate from non-admin {} — ignored", event.sender);
+                warn!("!translate from non-admin {}, ignored", event.sender);
                 return;
             }
             let rest = raw["!translate".len()..].trim();
@@ -372,7 +372,10 @@ pub(crate) async fn handle_message_core(
                 "debug" => translate_debug_report(&state, arg).await,
                 "version" => translate_version_report(),
                 "retry" => translate_retry_command(&state, &room, arg).await,
-                _ => "Usage: !translate <status|stats|debug <event-id>|retry <event-id>|version>"
+                _ => "🌍 !translate commands\n\
+                      🩺 status · 📊 stats · 🏷️ version\n\
+                      🔍 debug <event-id>\n\
+                      🔁 retry <event-id>"
                     .to_owned(),
             };
             if let Err(e) = room
@@ -545,7 +548,7 @@ pub(crate) async fn handle_redaction(state: BotState, room: Room, redacted_id: O
     };
 
     info!(
-        "Original message {redacted_id} was redacted — \
+        "Original message {redacted_id} was redacted: \
          redacting bot translation {bot_event_id}"
     );
 
@@ -573,7 +576,7 @@ pub(crate) fn resolve_thread_root(event: &OriginalSyncRoomMessageEvent) -> Owned
 
 /// Extracts the translatable text from an edit's new content: the body
 /// (reply-fallback stripped) for `m.text`/`m.emote`, or the caption for
-/// caption-bearing media types (a caption can itself be edited — the new
+/// caption-bearing media types (a caption can itself be edited: the new
 /// content then carries the same media msgtype as the original). Returns
 /// `None` when there is nothing translatable (unsupported msgtype, a
 /// filename-only caption, or empty text).
@@ -596,7 +599,7 @@ pub(crate) fn extract_edit_text(msgtype: &MessageType) -> Option<String> {
 
 /// Called when a user edits a message the bot previously translated.
 /// Re-translates the new content and edits the bot's existing translation
-/// in-place using m.replace — no new message is sent, thread context is preserved.
+/// in-place using m.replace. No new message is sent, thread context is preserved.
 pub(crate) async fn handle_edit(
     state: BotState,
     room: Room,
@@ -607,7 +610,7 @@ pub(crate) async fn handle_edit(
     let room_id = room.room_id().as_str().to_owned();
     let msgtype_label = new_content.msgtype.msgtype();
 
-    // Look up whether we have a translation for this event — waiting briefly
+    // Look up whether we have a translation for this event: waiting briefly
     // if the original message's own translation is still in flight (see
     // `lookup_translation_awaiting_pending`).
     let bot_event_id = match lookup_translation_awaiting_pending(
@@ -626,7 +629,7 @@ pub(crate) async fn handle_edit(
     let bot_event_id = bot_event_id.and_then(|id| matrix_sdk::ruma::EventId::parse(id).ok());
 
     let Some(bot_event_id) = bot_event_id else {
-        info!("Edit for unknown event {original_event_id} — no cached translation, ignoring");
+        info!("Edit for unknown event {original_event_id}, no cached translation, ignoring");
         record_skip(
             &state,
             &original_event_id,
@@ -731,7 +734,7 @@ pub(crate) async fn handle_edit(
     let (new_body, new_html) = build_translation_bodies(&lines);
 
     // Build m.replace pointing at the bot's existing translation event.
-    // The thread membership is inherited from bot_event_id — no thread relation needed here.
+    // The thread membership is inherited from bot_event_id. No thread relation needed here.
     // Preserve the same msgtype (m.notice vs m.text) as the original translation.
     let inner_msgtype = if translation.silent_messages {
         MessageType::Notice(NoticeMessageEventContent::html(
