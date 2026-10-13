@@ -25,7 +25,11 @@ pub(crate) struct PendingGuard {
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        let notify = self.pending.lock().unwrap().remove(&self.key);
+        let notify = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
         if let Some(notify) = notify {
             notify.notify_one();
         }
@@ -36,7 +40,7 @@ pub(crate) fn mark_pending(pending: &PendingMap, event_id: &OwnedEventId) -> Pen
     let key = event_id.as_str().to_owned();
     pending
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(key.clone(), Arc::new(Notify::new()));
     PendingGuard {
         pending: pending.clone(),
@@ -59,7 +63,11 @@ pub(crate) async fn lookup_translation_awaiting_pending(
     // a task that finishes between our first check and this one can't race
     // us out of seeing its notification: notify_one() stores its permit if
     // it fires before anyone is waiting yet.
-    let notify = pending.lock().unwrap().get(original_event_id).cloned();
+    let notify = pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(original_event_id)
+        .cloned();
 
     if let Some(found) = db.lookup_translation(original_event_id).await? {
         return Ok(Some(found));

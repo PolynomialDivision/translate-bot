@@ -99,6 +99,11 @@ admin_users = ["@you:matrix.org"]
 # Users allowed to invite the bot ("all" = anyone, [] = nobody).
 # Configured admins may always open a direct chat with the bot.
 allowed_inviters = ["@you:matrix.org"]
+# Rooms the bot may join: room IDs, [] for none, or "all" for every room.
+# Required: without it the bot refuses to start.
+allowed_rooms = ["!REPLACE_ME:example.org"]
+# Members of these rooms may also open a private chat with the bot.
+# dm_rooms = ["!REPLACE_ME:example.org"]
 
 # Which devices receive room keys. Options:
 #   identity_based: only devices cross-signed by their owner (default, recommended)
