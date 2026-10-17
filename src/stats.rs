@@ -22,6 +22,7 @@ pub(crate) enum SkipReason {
     EditUnknownEvent,
     EditNoTranslatableText,
     AlreadyTranslated,
+    IgnoredSender,
 }
 
 impl SkipReason {
@@ -42,6 +43,7 @@ impl SkipReason {
             Self::EditUnknownEvent => "edit_unknown_event",
             Self::EditNoTranslatableText => "edit_no_translatable_text",
             Self::AlreadyTranslated => "already_translated",
+            Self::IgnoredSender => "ignored_sender",
         }
     }
 }

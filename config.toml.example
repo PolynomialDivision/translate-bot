@@ -71,6 +71,10 @@ min_confidence = 0.5
 # being monopolized by one very long message. Longer input is skipped with
 # reason=input_too_long instead of being sent to the backend.
 # max_input_chars = 4000
+# Senders never translated (exact Matrix IDs), e.g. bots that already post in
+# several languages. Their edits and captions are skipped too
+# (reason=ignored_sender in !translate debug).
+# ignore_users = ["@heating-bot:example.org"]
 
 # Optional per-room translation overrides. Keys are Matrix room IDs.
 # Any omitted field inherits from [translation].
@@ -81,6 +85,7 @@ min_confidence = 0.5
 # [room_translations."!ghijkl:matrix.org"]
 # langs = ["de", "uk"]
 # silent_messages = true
+# ignore_users = ["@quiz-bot:matrix.org"]   # in addition to [translation] ignore_users
 
 [security]
 # Users allowed to run admin commands, privately in a

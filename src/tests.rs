@@ -960,6 +960,7 @@ fn room_translation_override_changes_only_langs() {
         retry_initial_backoff_ms: 250,
         overall_timeout_secs: 90,
         max_input_chars: 4_000,
+        ignore_users: Vec::new(),
     };
 
     let effective = effective_translation_config(&default, &rooms, "!room:example.org");
@@ -968,6 +969,67 @@ fn room_translation_override_changes_only_langs() {
     assert!(!effective.reply_to_original);
     assert!(!effective.thread_replies);
     assert!(effective.silent_messages);
+}
+
+#[test]
+fn ignored_senders_are_global_or_per_room() {
+    let default = TranslationConfig {
+        ignore_users: vec!["@heating-bot:example.org".to_owned()],
+        ..Default::default()
+    };
+    let mut rooms = HashMap::new();
+    rooms.insert(
+        "!room:example.org".to_owned(),
+        RoomTranslationConfig {
+            ignore_users: vec!["@quiz-bot:example.org".to_owned()],
+            ..Default::default()
+        },
+    );
+    let ignored = |room: &str, sender: &str| is_ignored_sender(&default, &rooms, room, sender);
+    // Global: in every room.
+    assert!(ignored("!room:example.org", "@heating-bot:example.org"));
+    assert!(ignored("!other:example.org", "@heating-bot:example.org"));
+    // Per room: only there, in addition to the global list.
+    assert!(ignored("!room:example.org", "@quiz-bot:example.org"));
+    assert!(!ignored("!other:example.org", "@quiz-bot:example.org"));
+    // Exact IDs only.
+    assert!(!ignored("!room:example.org", "@nick:example.org"));
+    assert!(!ignored("!room:example.org", "@heating-bot:other.org"));
+    check_ignore_users(&default, &rooms).unwrap();
+}
+
+#[test]
+fn ignore_users_must_be_matrix_ids() {
+    let default = TranslationConfig {
+        ignore_users: vec!["heating-bot".to_owned()],
+        ..Default::default()
+    };
+    assert!(check_ignore_users(&default, &HashMap::new()).is_err());
+    let mut rooms = HashMap::new();
+    rooms.insert(
+        "!room:example.org".to_owned(),
+        RoomTranslationConfig {
+            ignore_users: vec!["@ok:example.org".to_owned(), "nope".to_owned()],
+            ..Default::default()
+        },
+    );
+    assert!(check_ignore_users(&TranslationConfig::default(), &rooms).is_err());
+    // Parsed from TOML, global and per room.
+    let parsed: Config = toml::from_str(
+        "[matrix]\nhomeserver = \"https://m.x\"\nuser_id = \"@t:x\"\ndevice_id = \"D\"\n\
+         [libretranslate]\nurl = \"http://lt\"\n\
+         [translation]\nignore_users = [\"@heating-bot:x\"]\n\
+         [room_translations.\"!r:x\"]\nignore_users = [\"@quiz-bot:x\"]\n",
+    )
+    .unwrap();
+    assert_eq!(parsed.translation.ignore_users, ["@heating-bot:x"]);
+    assert!(is_ignored_sender(
+        &parsed.translation,
+        &parsed.room_translations,
+        "!r:x",
+        "@quiz-bot:x"
+    ));
+    check_ignore_users(&parsed.translation, &parsed.room_translations).unwrap();
 }
 
 #[test]

@@ -70,6 +70,11 @@ pub(crate) struct TranslationConfig {
     /// are nowhere near the default.
     #[serde(default = "default_max_input_chars")]
     pub(crate) max_input_chars: usize,
+    /// Senders whose messages are never translated (exact Matrix IDs, e.g.
+    /// other bots that post in several languages already). Their edits and
+    /// captions are skipped too; a room's `ignore_users` adds to these.
+    #[serde(default)]
+    pub(crate) ignore_users: Vec<String>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -79,6 +84,9 @@ pub(crate) struct RoomTranslationConfig {
     pub(crate) reply_to_original: Option<bool>,
     pub(crate) thread_replies: Option<bool>,
     pub(crate) silent_messages: Option<bool>,
+    /// Added to `[translation] ignore_users` in this room.
+    #[serde(default)]
+    pub(crate) ignore_users: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -142,8 +150,45 @@ impl Default for TranslationConfig {
             retry_initial_backoff_ms: default_translation_retry_initial_backoff_ms(),
             overall_timeout_secs: default_translation_overall_timeout_secs(),
             max_input_chars: default_max_input_chars(),
+            ignore_users: Vec::new(),
         }
     }
+}
+
+/// Whether `sender`'s messages in `room_id` are never translated.
+pub(crate) fn is_ignored_sender(
+    default: &TranslationConfig,
+    room_translations: &HashMap<String, RoomTranslationConfig>,
+    room_id: &str,
+    sender: &str,
+) -> bool {
+    default.ignore_users.iter().any(|u| u == sender)
+        || room_translations
+            .get(room_id)
+            .is_some_and(|room| room.ignore_users.iter().any(|u| u == sender))
+}
+
+/// Every `ignore_users` entry must be a Matrix user ID: a typo would
+/// otherwise silently ignore nobody.
+pub(crate) fn check_ignore_users(
+    default: &TranslationConfig,
+    room_translations: &HashMap<String, RoomTranslationConfig>,
+) -> Result<()> {
+    let rooms = room_translations
+        .iter()
+        .map(|(room, cfg)| (format!("[room_translations.\"{room}\"]"), &cfg.ignore_users));
+    for (section, users) in
+        std::iter::once(("[translation]".to_owned(), &default.ignore_users)).chain(rooms)
+    {
+        for user in users {
+            if UserId::parse(user.as_str()).is_err() {
+                anyhow::bail!(
+                    "{section} ignore_users: {user:?} is not a Matrix user ID (@name:server)"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn effective_translation_config(

@@ -54,7 +54,7 @@ use matrix_sdk::{
                 redaction::OriginalSyncRoomRedactionEvent,
             },
         },
-        OwnedEventId,
+        OwnedEventId, UserId,
     },
     Room, RoomState,
 };
@@ -100,6 +100,7 @@ async fn main() -> Result<()> {
 
     let config: Config =
         mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
+    check_ignore_users(&config.translation, &config.room_translations)?;
 
     let store_path = mxbot_common::config::store_path_from_env();
     fs::create_dir_all(&store_path).await?;

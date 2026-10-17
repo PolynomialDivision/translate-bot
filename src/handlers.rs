@@ -249,6 +249,30 @@ pub(crate) async fn handle_message_core(
     let room_id = room.room_id().as_str().to_owned();
     let sender = event.sender.as_str().to_owned();
 
+    // Senders never translated ([translation] / per-room ignore_users): before
+    // edits, captions and `!translate retry`, which all come through here.
+    if is_ignored_sender(
+        &state.translation,
+        &state.room_translations,
+        &room_id,
+        &sender,
+    ) {
+        debug!(
+            "Not translating {} from ignored sender {sender}",
+            event.event_id
+        );
+        record_skip(
+            &state,
+            &event.event_id,
+            &room_id,
+            Some(&sender),
+            event.content.msgtype.msgtype(),
+            "n/a",
+            SkipReason::IgnoredSender,
+        );
+        return;
+    }
+
     // Edits arrive as m.replace: route them to handle_edit and stop.
     // Must be checked BEFORE the msgtype guard: the top-level body of an edit
     // is only a fallback ("* new text") for old clients and must NOT be translated.
