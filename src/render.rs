@@ -104,21 +104,9 @@ pub(crate) fn strip_mx_reply(html: &str) -> String {
     html.to_owned()
 }
 
-/// Strip the leading Matrix reply-fallback block from a plain-text body:
-/// consecutive "> " lines at the top, followed by a blank separator line.
-/// Only the top block is removed so intentional blockquotes later in the
-/// message are preserved.
-pub(crate) fn strip_reply_fallback(raw: &str) -> String {
-    if raw.starts_with("> ") {
-        raw.lines()
-            .skip_while(|l| l.starts_with("> "))
-            .skip_while(|l| l.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        raw.to_owned()
-    }
-}
+/// The leading Matrix reply-fallback block of a plain-text body (the `>` lines at the top
+/// and the blank lines after them) is removed; a blockquote later in the message stays.
+pub(crate) use mxbot_common::format::strip_reply_fallback;
 
 pub(crate) fn build_text_line(
     target: &str,

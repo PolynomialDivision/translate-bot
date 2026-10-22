@@ -410,9 +410,8 @@ pub(crate) async fn handle_message_core(
                       🔁 retry <event-id>"
                     .to_owned(),
             };
-            if let Err(e) = room
-                .send(RoomMessageEventContent::notice_plain(reply))
-                .await
+            if let Err(e) =
+                send_with_retry(&room, RoomMessageEventContent::notice_plain(reply)).await
             {
                 warn!("Failed to send !translate reply: {e}");
             }

@@ -535,17 +535,21 @@ fn strip_mx_reply_trims_leading_whitespace_after_removal() {
 
 #[test]
 fn blockquote_strip_removes_leading_fallback_block() {
-    let raw = "> Alice said something\n> more quoted\n\nActual reply text";
-    let text: String = if raw.starts_with("> ") {
-        raw.lines()
-            .skip_while(|l| l.starts_with("> "))
-            .skip_while(|l| l.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        raw.to_owned()
-    };
-    assert_eq!(text.trim(), "Actual reply text");
+    let raw = "> Alice said something\n> more quoted\n\nActual reply text\n> own quote";
+    assert_eq!(strip_reply_fallback(raw), "Actual reply text\n> own quote");
+    // Only a fallback, no text of its own: nothing left to translate.
+    assert_eq!(strip_reply_fallback("> quoted\n>\n"), "");
+}
+
+#[test]
+fn rendered_house_infra_config_parses() {
+    // A copy of the config house-infra renders (fake secrets), as deployed.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/house-infra-config.toml");
+    let config: Config = mxbot_common::config::load_toml(std::path::Path::new(path))
+        .expect("the config house-infra renders");
+    check_ignore_users(&config.translation, &config.room_translations).unwrap();
+    config.security.validate().unwrap();
+    assert_eq!(config.translation.langs, ["en", "de", "uk"]);
 }
 
 #[test]
