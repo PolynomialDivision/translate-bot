@@ -2099,7 +2099,7 @@ dependencies = [
 [[package]]
 name = "mxbot-common"
 version = "0.2.0"
-source = "git+https://github.com/PolynomialDivision/mxbot-common#c386a67154d303493f93c65190b29e87455ca4c8"
+source = "git+https://github.com/PolynomialDivision/mxbot-common#53fa2563bfb817ed3ad95286adc1731e8dce5e1e"
 dependencies = [
  "anyhow",
  "futures-util",
