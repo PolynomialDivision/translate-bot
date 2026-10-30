@@ -126,10 +126,12 @@ pub(crate) fn build_text_line(
             reason,
         ));
     }
+    // The translation of a plain-text message is text, not markup: escaped for the HTML body,
+    // so a `<b>`, a link or an `&` in it shows as written instead of being interpreted.
     Ok(TranslatedLine {
         target: target.to_owned(),
-        plain: translated.clone(),
-        html: translated,
+        html: mxbot_common::format::html_escape(&translated),
+        plain: translated,
     })
 }
 

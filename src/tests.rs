@@ -243,6 +243,24 @@ fn formatting_is_shared_for_message_caption_and_edit_paths() {
 }
 
 #[test]
+fn translated_plain_text_is_escaped_in_the_html_body_only() {
+    let source = "<b>fett</b> <a href=\"https://x.example\">Link</a> & Co";
+    let translated = "<b>bold</b> <a href=\"https://x.example\">link</a> & Co".to_owned();
+    let line = build_text_line("en", source, translated.clone()).unwrap();
+
+    assert_eq!(line.plain, translated);
+    assert_eq!(
+        line.html,
+        "&lt;b&gt;bold&lt;/b&gt; &lt;a href=&quot;https://x.example&quot;&gt;link&lt;/a&gt; &amp; Co"
+    );
+
+    let (plain, html) = build_translation_bodies(&[line]);
+    assert_eq!(plain, format!("🇬🇧 {translated}"));
+    assert!(!html.contains("<b>") && !html.contains("<a "));
+    assert!(html.ends_with("&amp; Co"));
+}
+
+#[test]
 fn batch_failure_status_records_suppressed_partial_translation() {
     let failure = TranslationBatchFailure {
         source: "de".to_owned(),
