@@ -25,3 +25,8 @@ tracing = "0.1"
 
 [dev-dependencies]
 toml = "1"
+
+# A panic anywhere ends the bot and Docker restarts it, as a supervised task
+# that ends does (mxbot_common::supervise).
+[profile.release]
+panic = "abort"
