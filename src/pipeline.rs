@@ -242,6 +242,35 @@ pub(crate) async fn translate_all_targets(
     if let Err(ref failure) = result {
         log_suppressed_translation(state, failure, room_id, event_id);
     }
+    // For the status file: each message's translation done or failed.
+    let translations = mxbot_common::supervise::report("translations");
+    match &result {
+        Ok(_) => translations.ok(),
+        Err(failure) => translations.failed(batch_failure_reason(failure)),
+    }
 
     result
+}
+
+/// A failed translation for the status file: the target languages and error classes only,
+/// never the text or the backend's detail.
+pub(crate) fn batch_failure_reason(failure: &TranslationBatchFailure) -> String {
+    let mut targets: Vec<&str> = failure
+        .failed_targets
+        .iter()
+        .map(|f| f.target.as_str())
+        .collect();
+    targets.dedup();
+    let mut classes: Vec<&str> = failure
+        .failed_targets
+        .iter()
+        .map(|f| f.error.class())
+        .collect();
+    classes.sort_unstable();
+    classes.dedup();
+    format!(
+        "translation into {} failed: {}",
+        targets.join(", "),
+        classes.join(", ")
+    )
 }

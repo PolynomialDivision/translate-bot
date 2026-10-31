@@ -1466,3 +1466,26 @@ async fn lookup_translation_awaiting_pending_unrelated_event_is_unaffected() {
     assert_eq!(found, None);
     assert!(started.elapsed() < Duration::from_millis(500));
 }
+
+#[test]
+fn a_failed_translation_is_reported_without_text_or_detail() {
+    let failed = |target: &str, kind| TargetTranslationFailure {
+        target: target.to_owned(),
+        attempts: 3,
+        error: TranslationError::new(kind, "the message text and https://backend/?key=x"),
+    };
+    let failure = TranslationBatchFailure {
+        source: "de".to_owned(),
+        context: "message",
+        failed_targets: vec![
+            failed("en", TranslationErrorKind::Timeout),
+            failed("fr", TranslationErrorKind::HttpStatus(503)),
+            failed("ar", TranslationErrorKind::Timeout),
+        ],
+        suppressed: false,
+    };
+    assert_eq!(
+        batch_failure_reason(&failure),
+        "translation into en, fr, ar failed: backend_http_error, timeout"
+    );
+}
