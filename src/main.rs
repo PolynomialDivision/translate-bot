@@ -1,8 +1,10 @@
 mod backend;
 mod config;
 mod db;
+mod detect;
 mod handlers;
 mod pipeline;
+mod protect;
 mod render;
 mod reports;
 mod stats;
@@ -11,18 +13,20 @@ mod tests;
 
 use backend::*;
 use config::*;
+use detect::*;
 use handlers::*;
 use pipeline::*;
+use protect::*;
 use render::*;
 use reports::*;
 use stats::*;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc, LazyLock, RwLock,
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -38,7 +42,7 @@ use mxbot_common::{
 use db::{Db, DbEventOutcome};
 
 use anyhow::{Context, Result};
-use futures_util::future::join_all;
+use futures_util::future::{join_all, BoxFuture, FutureExt};
 use matrix_sdk::{
     deserialized_responses::EncryptionInfo,
     ruma::{
@@ -47,19 +51,18 @@ use matrix_sdk::{
             room::{
                 encrypted::OriginalSyncRoomEncryptedEvent,
                 message::{
-                    MessageFormat, MessageType, NoticeMessageEventContent,
+                    FormattedBody, MessageFormat, MessageType, NoticeMessageEventContent,
                     OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
                     RoomMessageEventContentWithoutRelation, TextMessageEventContent,
                 },
                 redaction::OriginalSyncRoomRedactionEvent,
             },
+            Mentions,
         },
         OwnedEventId, UserId,
     },
     Room, RoomState,
 };
-use pulldown_cmark::html::push_html;
-use pulldown_cmark::{Options, Parser};
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
@@ -79,7 +82,7 @@ struct BotState {
     startup_time: SystemTime,
     // Caps concurrent in-flight message handlers to bound task/connection growth.
     inflight: Arc<Semaphore>,
-    // Caps requests to ltengine across detection and translation.
+    // Caps translation requests to ltengine (the /detect fallback is not limited).
     lt_requests: Arc<Semaphore>,
     stats: Arc<Stats>,
     // Durable dedup (original event_id -> bot's translation event_id) and
@@ -92,6 +95,8 @@ struct BotState {
     // to update/delete. std Mutex: only ever held for a map lookup/insert,
     // never across an await.
     pending_translations: PendingMap,
+    // Each sender's last reliably detected language per room, for short messages.
+    sender_languages: SenderLanguages,
 }
 
 #[tokio::main]
@@ -147,7 +152,9 @@ async fn main() -> Result<()> {
         stats: Arc::new(Stats::new(db.clone())),
         db,
         pending_translations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        sender_languages: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
+    warn_about_backend_detection(&state.translation, &state.room_translations);
 
     // Probe ltengine reachability at startup so failures are visible in logs.
     info!("ltengine URL: {}", state.lt_url);
@@ -242,7 +249,7 @@ async fn main() -> Result<()> {
                         room.state()
                     );
                     record_skip(
-                        &state,
+                        &state.stats,
                         &ev.event_id,
                         room.room_id().as_str(),
                         Some(ev.sender.as_str()),
@@ -269,11 +276,10 @@ async fn main() -> Result<()> {
     // handler above (which only ever sees plaintext: the SDK recasts an event
     // to its plaintext type before dispatch, precisely when decryption
     // succeeded). Without this handler, undecryptable events were completely
-    // invisible: no log, no counter, nothing. Known limitation: matrix-sdk can
-    // later re-decrypt an event once a key arrives (see its `redecryptor`),
-    // but that does not re-invoke event handlers, so a late key does not
-    // retroactively translate the message. The room key needs to already be
-    // available at sync time.
+    // invisible: no log, no counter, nothing. matrix-sdk can later re-decrypt
+    // an event once a key arrives (see its `redecryptor`), but that does not
+    // re-invoke event handlers: the late retries fetch the event again after
+    // 30 s and 5 min, when the key has usually arrived.
     bot.client.add_event_handler({
         let state = state.clone();
         move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
@@ -283,14 +289,14 @@ async fn main() -> Result<()> {
                     return;
                 }
                 warn!(
-                    "Unable to decrypt {} from {} in {}: translation skipped",
+                    "Unable to decrypt {} from {} in {}: translation skipped for now",
                     ev.event_id,
                     ev.sender,
                     room.room_id()
                 );
                 state.stats.decrypt_failures.fetch_add(1, Ordering::Relaxed);
                 record_skip(
-                    &state,
+                    &state.stats,
                     &ev.event_id,
                     room.room_id().as_str(),
                     Some(ev.sender.as_str()),
@@ -298,6 +304,14 @@ async fn main() -> Result<()> {
                     "n/a",
                     SkipReason::DecryptFailed,
                 );
+                // The late retries bypass the backlog cut-off: only for events after it.
+                let live = ev
+                    .origin_server_ts
+                    .to_system_time()
+                    .is_none_or(|time| time >= state.startup_time);
+                if live {
+                    schedule_late_retries(&state, &room, ev.event_id, &LATE_RETRIES_UNDECRYPTABLE);
+                }
             }
         }
     });
@@ -332,4 +346,23 @@ async fn main() -> Result<()> {
         stats.sync_reconnects.fetch_add(1, Ordering::Relaxed);
     })
     .await
+}
+
+/// Rooms with a language the local detector does not know ask the backend's `/detect`.
+fn warn_about_backend_detection(
+    default: &TranslationConfig,
+    room_translations: &HashMap<String, RoomTranslationConfig>,
+) {
+    let rooms = room_translations
+        .iter()
+        .filter_map(|(room, cfg)| Some((room.as_str(), cfg.langs.as_ref()?)));
+    for (scope, langs) in std::iter::once(("[translation]", &default.langs)).chain(rooms) {
+        let unknown = unsupported_langs(langs);
+        if !unknown.is_empty() {
+            warn!(
+                "{scope}: languages {unknown:?} are unknown to the local language detection: \
+                 detection there asks the backend"
+            );
+        }
+    }
 }

@@ -133,10 +133,35 @@ pub(crate) struct TranslationBatchFailure {
     pub(crate) suppressed: bool,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum TranslationInput<'a> {
-    Text { plain: &'a str },
-    Html { html: &'a str, plain: &'a str },
+/// The backend as the pipeline sees it: [`BotState`] in production, a scripted fake in tests.
+pub(crate) trait Translator: Sync {
+    fn translate<'a>(
+        &'a self,
+        text: &'a str,
+        source: &'a str,
+        target: &'a str,
+        format: TextFormat,
+    ) -> BoxFuture<'a, Result<String, TranslationError>>;
+
+    /// The backend's `/detect`, for rooms with a language the local detector does not know.
+    fn detect<'a>(&'a self, text: &'a str) -> BoxFuture<'a, Option<(String, f64)>>;
+}
+
+impl Translator for BotState {
+    fn translate<'a>(
+        &'a self,
+        text: &'a str,
+        source: &'a str,
+        target: &'a str,
+        format: TextFormat,
+    ) -> BoxFuture<'a, Result<String, TranslationError>> {
+        self.backend_translate(text, source, target, format.as_str())
+            .boxed()
+    }
+
+    fn detect<'a>(&'a self, text: &'a str) -> BoxFuture<'a, Option<(String, f64)>> {
+        self.backend_detect(text).boxed()
+    }
 }
 
 impl BotState {
@@ -148,13 +173,29 @@ impl BotState {
         TranslationRetryPolicy::from_config(&self.translation)
     }
 
-    pub(crate) async fn detect(&self, text: &str) -> Option<(String, f64)> {
-        let _permit = self
-            .lt_requests
-            .acquire()
-            .await
-            .map_err(|e| warn!("ltengine request limiter closed: {e}"))
-            .ok()?;
+    pub(crate) fn pipeline<'a>(
+        &'a self,
+        translation: &'a EffectiveTranslationConfig,
+        context: &'static str,
+        room_id: &'a str,
+        sender: &'a str,
+        event_id: &'a OwnedEventId,
+    ) -> Pipeline<'a> {
+        Pipeline {
+            translation,
+            policy: self.retry_policy(),
+            max_input_chars: self.translation.max_input_chars,
+            stats: &self.stats,
+            memory: &self.sender_languages,
+            context,
+            room_id,
+            sender,
+            event_id,
+        }
+    }
+
+    /// Not limited by `lt_requests`: a detection must not wait behind running translations.
+    pub(crate) async fn backend_detect(&self, text: &str) -> Option<(String, f64)> {
         let resp = self
             .http
             .post(format!("{}/detect", self.lt_url))
@@ -184,7 +225,7 @@ impl BotState {
             .map(|r| (r.language, normalize_confidence(r.confidence)))
     }
 
-    pub(crate) async fn translate(
+    pub(crate) async fn backend_translate(
         &self,
         text: &str,
         source: &str,
@@ -196,61 +237,77 @@ impl BotState {
             TranslationError::new(TranslationErrorKind::Request, e.to_string())
         })?;
 
-        let request_timeout = self.retry_policy().request_timeout;
-        let request = async {
-            let resp = self
-                .http
-                .post(format!("{}/translate", self.lt_url))
-                .json(&TranslateRequest {
-                    q: text,
-                    source,
-                    target,
-                    format,
-                    api_key: self.lt_api_key.as_deref(),
-                })
-                .send()
-                .await
-                .map_err(|e| TranslationError::new(TranslationErrorKind::Request, e.to_string()))?;
-
-            let status = resp.status();
-            let retry_after = parse_retry_after(resp.headers());
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| TranslationError::new(TranslationErrorKind::Request, e.to_string()))?;
-
-            if !status.is_success() {
-                let kind = if is_backend_busy_body(&body) {
-                    TranslationErrorKind::BackendBusy
-                } else {
-                    TranslationErrorKind::HttpStatus(status.as_u16())
-                };
-                return Err(TranslationError::new(kind, response_excerpt(&body))
-                    .with_retry_after(retry_after));
-            }
-
-            match serde_json::from_str::<TranslateResponse>(&body) {
-                Ok(result) => Ok(result.translated_text),
-                Err(_) if is_backend_busy_body(&body) => Err(TranslationError::new(
-                    TranslationErrorKind::BackendBusy,
-                    response_excerpt(&body),
-                )),
-                // Unlike the error-status and backend-busy cases above, a
-                // 2xx response that fails to parse as {"translatedText":...}
-                // is exactly the shape most likely to contain the translated
-                // user content itself (truncated/malformed JSON, but the
-                // text is still in there): log the parse error and size
-                // only, never the body, so translated content never reaches
-                // logs.
-                Err(e) => Err(TranslationError::new(
-                    TranslationErrorKind::ResponseParse,
-                    format!("{e} (body_len={} bytes)", body.len()),
-                )),
-            }
+        let request = TranslateRequest {
+            q: text,
+            source,
+            target,
+            format,
+            api_key: self.lt_api_key.as_deref(),
         };
-
-        with_translation_timeout(request_timeout, request).await
+        post_translate(
+            &self.http,
+            &self.lt_url,
+            &request,
+            self.retry_policy().request_timeout,
+        )
+        .await
     }
+}
+
+/// One `/translate` request to a LibreTranslate-compatible backend.
+pub(crate) async fn post_translate(
+    http: &reqwest::Client,
+    lt_url: &str,
+    request: &TranslateRequest<'_>,
+    request_timeout: Duration,
+) -> Result<String, TranslationError> {
+    let request = async {
+        let resp = http
+            .post(format!("{lt_url}/translate"))
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| TranslationError::new(TranslationErrorKind::Request, e.to_string()))?;
+
+        let status = resp.status();
+        let retry_after = parse_retry_after(resp.headers());
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| TranslationError::new(TranslationErrorKind::Request, e.to_string()))?;
+
+        if !status.is_success() {
+            let kind = if is_backend_busy_body(&body) {
+                TranslationErrorKind::BackendBusy
+            } else {
+                TranslationErrorKind::HttpStatus(status.as_u16())
+            };
+            return Err(
+                TranslationError::new(kind, response_excerpt(&body)).with_retry_after(retry_after)
+            );
+        }
+
+        match serde_json::from_str::<TranslateResponse>(&body) {
+            Ok(result) => Ok(result.translated_text),
+            Err(_) if is_backend_busy_body(&body) => Err(TranslationError::new(
+                TranslationErrorKind::BackendBusy,
+                response_excerpt(&body),
+            )),
+            // Unlike the error-status and backend-busy cases above, a
+            // 2xx response that fails to parse as {"translatedText":...}
+            // is exactly the shape most likely to contain the translated
+            // user content itself (truncated/malformed JSON, but the
+            // text is still in there): log the parse error and size
+            // only, never the body, so translated content never reaches
+            // logs.
+            Err(e) => Err(TranslationError::new(
+                TranslationErrorKind::ResponseParse,
+                format!("{e} (body_len={} bytes)", body.len()),
+            )),
+        }
+    };
+
+    with_translation_timeout(request_timeout, request).await
 }
 
 pub(crate) async fn with_translation_timeout<T, Fut>(
@@ -420,7 +477,7 @@ where
 }
 
 pub(crate) fn log_suppressed_translation(
-    state: &BotState,
+    stats: &Stats,
     failure: &TranslationBatchFailure,
     room_id: &str,
     event_id: &OwnedEventId,
@@ -446,12 +503,11 @@ pub(crate) fn log_suppressed_translation(
         failure.context, failure.source, failed, failure.suppressed
     );
 
-    state
-        .stats
+    stats
         .translation_api_failures
         .fetch_add(failure.failed_targets.len() as u64, Ordering::Relaxed);
-    state.stats.record_skip(SkipReason::TranslationSuppressed);
-    state.stats.push_outcome(EventOutcome {
+    stats.record_skip(SkipReason::TranslationSuppressed);
+    stats.push_outcome(EventOutcome {
         event_id: event_id.clone(),
         room_id: room_id.to_owned(),
         sender: None,

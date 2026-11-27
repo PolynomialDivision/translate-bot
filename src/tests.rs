@@ -246,7 +246,7 @@ fn formatting_is_shared_for_message_caption_and_edit_paths() {
 fn translated_plain_text_is_escaped_in_the_html_body_only() {
     let source = "<b>fett</b> <a href=\"https://x.example\">Link</a> & Co";
     let translated = "<b>bold</b> <a href=\"https://x.example\">link</a> & Co".to_owned();
-    let line = build_text_line("en", source, translated.clone()).unwrap();
+    let line = build_line("en", source, &translated, TextFormat::Text, &[]).unwrap();
 
     assert_eq!(line.plain, translated);
     assert_eq!(
@@ -391,26 +391,6 @@ fn error_classification_retries_only_transient_failures() {
 }
 
 #[test]
-fn render_html_bold_italic() {
-    let html = render_html("This is **bold** and *italic*");
-    assert!(html.contains("<strong>bold</strong>"));
-    assert!(html.contains("<em>italic</em>"));
-}
-
-#[test]
-fn render_html_code_block_preserved() {
-    let html = render_html("```rust\nlet x = 5;\n```");
-    assert!(html.contains("let x = 5;"));
-    assert!(html.contains("<code"));
-}
-
-#[test]
-fn render_html_inline_code_preserved() {
-    let html = render_html("Run `cargo build` to compile");
-    assert!(html.contains("<code>cargo build</code>"));
-}
-
-#[test]
 fn html_to_plain_strips_tags() {
     let plain = html_to_plain("<p><strong>Hello</strong> world</p>");
     assert_eq!(plain, "Hello world");
@@ -439,15 +419,15 @@ fn html_to_plain_empty() {
 }
 
 #[test]
-fn render_and_strip_roundtrip() {
-    let plain = html_to_plain(&render_html("Hello **world**"));
+fn html_to_plain_of_nested_formatting() {
+    let plain = html_to_plain("<p>Hello <strong>world</strong></p>\n");
     assert_eq!(plain, "Hello world");
 }
 
 #[test]
 fn html_to_plain_decodes_entities() {
-    let plain = html_to_plain(&render_html("a & b < c > d"));
-    assert_eq!(plain, "a & b < c > d");
+    let plain = html_to_plain("<p>a &amp; b &lt; c &gt; d &#x27;e&#x27; &euro;</p>");
+    assert_eq!(plain, "a & b < c > d 'e' €");
 }
 
 #[test]
@@ -529,24 +509,32 @@ fn accepts_model_control_token_when_it_was_in_source() {
     );
 }
 
-// ── strip_mx_reply tests ──────────────────────────────────────────────────
+// ── reply fallback in HTML (removed by protect) ──────────────────────────
+
+fn protected_html(html: &str) -> String {
+    let source = SourceContent {
+        plain: "-".to_owned(),
+        html: Some(html.to_owned()),
+    };
+    protect(&source).0.html.unwrap()
+}
 
 #[test]
-fn strip_mx_reply_removes_wrapper() {
+fn protect_removes_mx_reply_wrapper() {
     let html = "<mx-reply><blockquote>quoted</blockquote></mx-reply>Actual message";
-    assert_eq!(strip_mx_reply(html), "Actual message");
+    assert_eq!(protected_html(html), "Actual message");
 }
 
 #[test]
-fn strip_mx_reply_passthrough_when_no_wrapper() {
+fn protect_passes_html_without_reply_through() {
     let html = "<p>Normal message</p>";
-    assert_eq!(strip_mx_reply(html), html);
+    assert_eq!(protected_html(html), html);
 }
 
 #[test]
-fn strip_mx_reply_trims_leading_whitespace_after_removal() {
+fn protect_trims_leading_whitespace_after_mx_reply() {
     let html = "<mx-reply><blockquote>q</blockquote></mx-reply>\n\n<p>message</p>";
-    assert_eq!(strip_mx_reply(html), "<p>message</p>");
+    assert_eq!(protected_html(html), "<p>message</p>");
 }
 
 // ── blockquote stripping tests ────────────────────────────────────────────
@@ -738,10 +726,14 @@ fn media_caption_kind_unsupported_type_is_ignored() {
     assert_eq!(media_caption_kind(&msgtype), None);
 }
 
-// ── extract_edit_text tests ──────────────────────────────────────────────
+// ── source_content of an edit's new content ──────────────────────────────
 // Edits of captioned media arrive with the same media msgtype as the
 // original (not m.text). These pin down that handle_edit can extract
 // text from that shape too, not just m.text/m.emote.
+
+fn extract_edit_text(msgtype: &MessageType) -> Option<String> {
+    source_content(msgtype).ok().map(|source| source.plain)
+}
 
 #[test]
 fn extract_edit_text_from_text_strips_reply_fallback() {
@@ -1271,16 +1263,16 @@ fn json_thread_shape() {
 
 // ── Image caption path integration ───────────────────────────────────────
 //
-// handle_media_caption() builds its relation with exactly:
+// A caption goes through handle_message_core like a message and gets its
+// relation from the same calls:
 //
 //   let thread_root = resolve_thread_root(&event);
 //   content.relates_to = make_relation(
 //       &event.event_id, &thread_root,
-//       state.reply_to_original, state.thread_replies,
+//       state.reply_to_original, state.thread_replies, in_thread,
 //   );
 //
-// This is the same call as handle_message().  The tests below reproduce
-// that call sequence directly, proving both paths exercise the same logic.
+// The tests below reproduce that call sequence directly.
 //
 // resolve_thread_root() returns:
 //   - event.event_id   when the event is NOT already in a thread
@@ -1321,7 +1313,7 @@ fn image_caption_threaded_event_thread_relation() {
     let thread_root = thread_root_id.clone();
 
     let mut content = make_translation_content("🇩🇪 Hallo".into(), "🇩🇪 Hallo".into(), false);
-    // in_thread=true mirrors what handle_media_caption now passes
+    // in_thread=true mirrors what handle_message_core passes for a threaded caption
     content.relates_to = make_relation(&caption_event_id, &thread_root, true, false, true);
 
     let json = serde_json::to_value(&content).unwrap();
@@ -1487,5 +1479,1064 @@ fn a_failed_translation_is_reported_without_text_or_detail() {
     assert_eq!(
         batch_failure_reason(&failure),
         "translation into en, fr, ar failed: backend_http_error, timeout"
+    );
+}
+
+// ── Local language detection (B1) ─────────────────────────────────────────
+
+fn room_langs() -> Vec<String> {
+    vec!["en".to_owned(), "de".to_owned(), "uk".to_owned()]
+}
+
+const GERMAN_SHORT: &[&str] = &[
+    "ok danke",
+    "bis später",
+    "guten morgen zusammen",
+    "passt",
+    "kommst du heute abend?",
+    "ich bin gleich da",
+    "danke für die info",
+    "wer hat noch milch?",
+    "das klingt gut",
+    "ich komme etwas später",
+    "hat jemand meinen schlüssel gesehen?",
+    "die waschmaschine ist frei",
+    "können wir morgen reden?",
+    "alles klar, bis dann",
+    "ich koche heute nudeln",
+    "wo ist der staubsauger?",
+    "schönes wochenende euch allen",
+    "mir geht es gut",
+];
+
+const ENGLISH_SHORT: &[&str] = &[
+    "sounds good",
+    "dinner is ready",
+    "see you later",
+    "thanks a lot",
+    "good morning everyone",
+    "is anyone home?",
+    "I will be late today",
+    "where is the vacuum cleaner?",
+    "the washing machine is free",
+    "can we talk tomorrow?",
+    "who has the keys?",
+    "have a nice weekend",
+    "I am cooking pasta tonight",
+    "let me know",
+    "that works for me",
+    "the package arrived",
+    "thank you so much",
+    "what time is the meeting?",
+];
+
+const UKRAINIAN_SHORT: &[&str] = &[
+    "добре",
+    "вечеря готова",
+    "дякую",
+    "доброго ранку всім",
+    "до зустрічі",
+    "я буду пізніше",
+    "хто має ключі?",
+    "пральна машина вільна",
+    "можемо поговорити завтра?",
+    "гарних вихідних",
+    "я сьогодні готую макарони",
+    "де пилосос?",
+    "все гаразд",
+    "посилка прийшла",
+    "дякую за інформацію",
+    "я вже йду",
+];
+
+/// Short messages the allow-list detection gets wrong, all English and German taken for each
+/// other: too few letters for trigrams to tell them apart.
+const KNOWN_MISSES: &[(&str, &str)] = &[
+    ("passt", "en"),
+    ("sounds good", "de"),
+    ("dinner is ready", "de"),
+    ("let me know", "de"),
+    ("thank you so much", "de"),
+];
+
+#[test]
+fn short_messages_are_detected_among_the_room_languages() {
+    let langs = room_langs();
+    let mut right = 0;
+    let mut total = 0;
+    let mut misses = Vec::new();
+    for (expected, list) in [
+        ("de", GERMAN_SHORT),
+        ("en", ENGLISH_SHORT),
+        ("uk", UKRAINIAN_SHORT),
+    ] {
+        assert!(list.len() >= 15);
+        for text in list {
+            let prose = prose_for_detection(text);
+            assert!(has_translatable_text(&prose), "{text}");
+            let detection = detect(&prose, &langs).expect(text);
+            assert!(langs.contains(&detection.lang), "{text}: {detection:?}");
+            total += 1;
+            if detection.lang == expected {
+                right += 1;
+            } else {
+                misses.push((*text, detection.lang));
+            }
+        }
+    }
+    let known: Vec<(&str, String)> = KNOWN_MISSES
+        .iter()
+        .map(|(text, lang)| (*text, (*lang).to_owned()))
+        .collect();
+    assert_eq!(misses, known);
+    assert!(right * 100 >= total * 85, "{right}/{total}");
+}
+
+#[test]
+fn messages_without_letters_are_not_translatable() {
+    for text in [
+        "https://example.org/a/b",
+        "👍",
+        "42",
+        "@anna:example.org",
+        "`make`",
+    ] {
+        assert!(!has_translatable_text(&prose_for_detection(text)), "{text}");
+    }
+    // Two letters are text: detected, and among the room's languages.
+    let prose = prose_for_detection("ok");
+    assert!(has_translatable_text(&prose));
+    assert!(room_langs().contains(&detect(&prose, &room_langs()).unwrap().lang));
+}
+
+#[test]
+fn links_ids_and_code_are_left_out_of_detection() {
+    let text = "Schau mal hier https://www.example.org/the-best-recipes/pumpkin-soup-with-ginger?ref=share \
+                und hier https://example.org/news/weather-today, @anna:example.org kennt `make build` schon";
+    let prose = prose_for_detection(text);
+    assert_eq!(prose, "Schau mal hier und hier , kennt schon");
+    assert_eq!(detect(&prose, &room_langs()).unwrap().lang, "de");
+    assert_eq!(
+        prose_for_detection(
+            "siehe ```\nlet x = 1;\n``` und #room:example.org oder !abc:example.org"
+        ),
+        "siehe und oder"
+    );
+    // Not IDs: no server part.
+    assert_eq!(prose_for_detection("!translate @ #1:"), "!translate @ #1:");
+}
+
+#[tokio::test]
+async fn an_unreliable_message_takes_the_senders_last_reliable_language() {
+    let memory = SenderLanguages::default();
+    let langs = room_langs();
+    let detect = |text: &'static str, sender: &'static str| {
+        let memory = memory.clone();
+        let langs = langs.clone();
+        async move {
+            detect_source_language(
+                &memory,
+                &langs,
+                "!room:example.org",
+                sender,
+                text,
+                |_| async { panic!("no backend detection for known languages") },
+            )
+            .await
+        }
+    };
+    // "ok" alone is not reliable.
+    assert!(!detect("ok", "@ben:example.org")
+        .await
+        .is_ok_and(|(_, c)| c > 0.9));
+    let (lang, _) = detect(
+        "Привіт усім, я сьогодні трохи запізнюся",
+        "@anna:example.org",
+    )
+    .await
+    .unwrap();
+    assert_eq!(lang, "uk");
+    assert_eq!(
+        detect("ok", "@anna:example.org").await,
+        Ok(("uk".to_owned(), 1.0))
+    );
+    // Per sender.
+    assert_ne!(detect("ok", "@ben:example.org").await.unwrap().0, "uk");
+    memory.lock().unwrap().insert(
+        (
+            "!room:example.org".to_owned(),
+            "@ben:example.org".to_owned(),
+        ),
+        "de".to_owned(),
+    );
+    assert_eq!(
+        detect("sounds good", "@ben:example.org").await,
+        Ok(("de".to_owned(), 1.0))
+    );
+    assert_eq!(
+        detect("https://example.org/a/b", "@anna:example.org").await,
+        Err(SkipReason::NoTranslatableText)
+    );
+}
+
+#[tokio::test]
+async fn a_room_language_unknown_to_whatlang_asks_the_backend() {
+    let memory = SenderLanguages::default();
+    let langs = vec!["de".to_owned(), "eu".to_owned()];
+    assert_eq!(unsupported_langs(&langs), ["eu"]);
+    assert!(unsupported_langs(&room_langs()).is_empty());
+    let asked = AtomicUsize::new(0);
+    let detected = detect_source_language(
+        &memory,
+        &langs,
+        "!room:example.org",
+        "@anna:example.org",
+        "Kaixo, zer moduz https://example.org/x",
+        |prose| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(prose, "Kaixo, zer moduz");
+            async { Some(("eu".to_owned(), 0.8)) }
+        },
+    )
+    .await;
+    assert_eq!(detected, Ok(("eu".to_owned(), 0.8)));
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+}
+
+// ── The pipeline with a scripted translator (B2-B5) ──────────────────────
+
+type Answer = dyn Fn(&str, &str, TextFormat) -> Result<String, TranslationError> + Send + Sync;
+
+/// A backend answering with `answer(text, target, format)` and recording every request.
+struct FakeTranslator {
+    answer: Box<Answer>,
+    calls: std::sync::Mutex<Vec<(String, String, TextFormat)>>,
+}
+
+impl FakeTranslator {
+    fn new(
+        answer: impl Fn(&str, &str, TextFormat) -> Result<String, TranslationError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            answer: Box::new(answer),
+            calls: Default::default(),
+        }
+    }
+
+    /// Prefixes the target language: a translation that differs from its source.
+    fn tagging() -> Self {
+        Self::new(|text, target, _| Ok(tag(text, target)))
+    }
+
+    fn calls(&self) -> Vec<(String, String, TextFormat)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Translator for FakeTranslator {
+    fn translate<'a>(
+        &'a self,
+        text: &'a str,
+        _source: &'a str,
+        target: &'a str,
+        format: TextFormat,
+    ) -> BoxFuture<'a, Result<String, TranslationError>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((text.to_owned(), target.to_owned(), format));
+        let answer = (self.answer)(text, target, format);
+        async move { answer }.boxed()
+    }
+
+    fn detect<'a>(&'a self, _text: &'a str) -> BoxFuture<'a, Option<(String, f64)>> {
+        async { None }.boxed()
+    }
+}
+
+/// `text` marked as translated into `target`, inside a leading paragraph.
+fn tag(text: &str, target: &str) -> String {
+    match text.strip_prefix("<p>") {
+        Some(rest) => format!("<p>[{target}] {rest}"),
+        None => format!("[{target}] {text}"),
+    }
+}
+
+struct Harness {
+    stats: Stats,
+    memory: SenderLanguages,
+    translation: EffectiveTranslationConfig,
+    event_id: OwnedEventId,
+}
+
+impl Harness {
+    fn new() -> Self {
+        let mut translation = test_translation_config();
+        // As in production: detection inside the room's languages decides, not a threshold.
+        translation.min_confidence = 0.0;
+        Self {
+            stats: Stats::new(Db::open_in_memory().unwrap()),
+            memory: SenderLanguages::default(),
+            translation,
+            event_id: eid("$ev:example.org"),
+        }
+    }
+
+    fn pipeline(&self, context: &'static str) -> Pipeline<'_> {
+        Pipeline {
+            translation: &self.translation,
+            policy: test_policy(),
+            max_input_chars: DEFAULT_MAX_INPUT_CHARS,
+            stats: &self.stats,
+            memory: &self.memory,
+            context,
+            room_id: "!room:example.org",
+            sender: "@anna:example.org",
+            event_id: &self.event_id,
+        }
+    }
+
+    async fn run(
+        &self,
+        translator: &FakeTranslator,
+        source: &SourceContent,
+    ) -> Result<Translation, NotTranslated> {
+        translate_source(translator, &self.pipeline("message"), source).await
+    }
+}
+
+const GERMAN_SENTENCE: &str =
+    "Das Abendessen ist heute um sieben Uhr fertig, bringt bitte Teller mit.";
+const GERMAN_HTML: &str =
+    "<p>Das Abendessen ist heute um <strong>sieben Uhr</strong> fertig, bringt bitte Teller mit.</p>";
+
+fn formatted_text() -> TextMessageEventContent {
+    TextMessageEventContent::html(GERMAN_SENTENCE, GERMAN_HTML)
+}
+
+fn formatted_image() -> MessageType {
+    let mut image = ImageMessageEventContent::plain(GERMAN_SENTENCE.into(), mxc());
+    image.filename = Some("dinner.jpg".into());
+    image.formatted = Some(FormattedBody::html(GERMAN_HTML));
+    MessageType::Image(image)
+}
+
+fn translated(result: Result<Translation, NotTranslated>) -> Translation {
+    match result {
+        Ok(translation) => translation,
+        Err(e) => panic!("not translated: {e:?}"),
+    }
+}
+
+#[tokio::test]
+async fn message_caption_and_edit_give_the_same_lines() {
+    let harness = Harness::new();
+    let message = MessageType::Text(formatted_text());
+    let edit = RoomMessageEventContentWithoutRelation::new(MessageType::Text(formatted_text()));
+    let mut lines = Vec::new();
+    for (context, msgtype) in [
+        ("message", &message),
+        ("image", &formatted_image()),
+        ("edit", &edit.msgtype),
+    ] {
+        let source = source_content(msgtype).unwrap();
+        assert_eq!(source.html.as_deref(), Some(GERMAN_HTML), "{context}");
+        let translator = FakeTranslator::tagging();
+        let result =
+            translated(translate_source(&translator, &harness.pipeline(context), &source).await);
+        assert_eq!(result.lang, "de");
+        assert!(translator.calls().iter().all(|c| c.2 == TextFormat::Html));
+        lines.push(result.lines);
+    }
+    assert_eq!(lines[0], lines[1]);
+    assert_eq!(lines[0], lines[2]);
+    assert_eq!(
+        lines[0][0].html,
+        "[en] Das Abendessen ist heute um <strong>sieben Uhr</strong> fertig, bringt bitte Teller mit."
+    );
+}
+
+#[tokio::test]
+async fn an_edit_and_a_caption_keep_their_formatting() {
+    let harness = Harness::new();
+    let edit = RoomMessageEventContentWithoutRelation::new(MessageType::Text(formatted_text()));
+    let source = source_content(&edit.msgtype).unwrap();
+    let result = translated(
+        translate_source(
+            &FakeTranslator::tagging(),
+            &harness.pipeline("edit"),
+            &source,
+        )
+        .await,
+    );
+    let content = make_translation_edit(&result.lines, false, eid("$bot:example.org"));
+    let json = serde_json::to_value(&content).unwrap();
+    assert_eq!(json["m.relates_to"]["rel_type"], "m.replace");
+    assert_eq!(json["m.relates_to"]["event_id"], "$bot:example.org");
+    let new_content = &json["m.new_content"];
+    assert_eq!(new_content["format"], "org.matrix.custom.html");
+    assert!(new_content["formatted_body"]
+        .as_str()
+        .unwrap()
+        .contains("<strong>sieben Uhr</strong>"));
+    assert!(new_content["body"]
+        .as_str()
+        .unwrap()
+        .starts_with("🇬🇧 [en] Das"));
+    assert!(json["body"].as_str().unwrap().starts_with("* 🇬🇧 [en] Das"));
+
+    let source = source_content(&formatted_image()).unwrap();
+    let result = translated(
+        translate_source(
+            &FakeTranslator::tagging(),
+            &harness.pipeline("image"),
+            &source,
+        )
+        .await,
+    );
+    let (plain, html) = build_translation_bodies(&result.lines);
+    let json = serde_json::to_value(make_translation_content(plain, html, false)).unwrap();
+    assert!(json["formatted_body"]
+        .as_str()
+        .unwrap()
+        .contains("<strong>sieben Uhr</strong>"));
+}
+
+#[tokio::test]
+async fn a_backend_answering_503_gets_max_attempts_requests_per_target_and_no_text_fallback() {
+    let harness = Harness::new();
+    let translator = FakeTranslator::new(|_, _, _| {
+        Err(TranslationError::new(
+            TranslationErrorKind::HttpStatus(503),
+            "unavailable",
+        ))
+    });
+    let source = source_content(&MessageType::Text(formatted_text())).unwrap();
+    let Err(NotTranslated::Failed(failure)) = harness.run(&translator, &source).await else {
+        panic!("expected a failed batch");
+    };
+    let calls = translator.calls();
+    for target in ["en", "uk"] {
+        let requests: Vec<_> = calls.iter().filter(|c| c.1 == target).collect();
+        assert_eq!(requests.len(), test_policy().max_attempts, "{target}");
+        assert!(requests.iter().all(|c| c.2 == TextFormat::Html), "{target}");
+    }
+    assert!(should_retry_later(&failure));
+}
+
+#[tokio::test]
+async fn a_rejected_html_translation_falls_back_to_text() {
+    let harness = Harness::new();
+    let translator = FakeTranslator::new(|text, target, format| match format {
+        TextFormat::Html => Err(TranslationError::new(
+            TranslationErrorKind::HttpStatus(400),
+            "bad request",
+        )),
+        TextFormat::Text => Ok(tag(text, target)),
+    });
+    let source = source_content(&MessageType::Text(formatted_text())).unwrap();
+    let result = translated(harness.run(&translator, &source).await);
+    assert_eq!(result.lines.len(), 2);
+    let formats: Vec<TextFormat> = translator.calls().iter().map(|c| c.2).collect();
+    assert_eq!(
+        formats.iter().filter(|f| **f == TextFormat::Html).count(),
+        2
+    );
+    assert_eq!(
+        formats.iter().filter(|f| **f == TextFormat::Text).count(),
+        2
+    );
+}
+
+// ── Placeholders (B3) ────────────────────────────────────────────────────
+
+const PILL: &str = "<a href=\"https://matrix.to/#/@anna:example.org\">Anna</a>";
+
+/// (name, formatted_body, what the backend must not see)
+const FIXTURES: &[(&str, &str, &[&str])] = &[
+    (
+        "pill",
+        "Hallo <a href=\"https://matrix.to/#/@anna:example.org\">Anna</a>, kommst du heute?",
+        &["matrix.to", "@anna"],
+    ),
+    (
+        "two pills",
+        "<a href=\"https://matrix.to/#/@anna:example.org\">Anna</a> und \
+         <a href=\"https://matrix.to/#/@ben:example.org\">Ben</a>: das Essen ist fertig",
+        &["matrix.to", "Ben"],
+    ),
+    (
+        "bare URL",
+        "Siehe <a href=\"https://example.org/a/b?c=d&amp;e=f\">https://example.org/a/b?c=d&amp;e=f</a> für Details",
+        &["https://", "example.org"],
+    ),
+    (
+        "link with text",
+        "Hier ist das <a href=\"https://example.org/rezept\">Rezept</a> für heute",
+        &["https://", "example.org"],
+    ),
+    (
+        "inline code",
+        "Bitte zuerst <code>make build</code> ausführen",
+        &["make build"],
+    ),
+    (
+        "code block with a comment",
+        "<p>Probier das:</p>\n<pre><code class=\"language-sh\"># Dienst neu starten\nsystemctl restart example\n</code></pre>\n",
+        &["Dienst", "systemctl"],
+    ),
+    (
+        "custom emoji",
+        "Gut gemacht <img data-mx-emoticon src=\"mxc://example.org/abc\" alt=\":party:\" title=\":party:\" height=\"32\">",
+        &["mxc://", ":party:"],
+    ),
+    (
+        "spoiler",
+        "Das Ende: <span data-mx-spoiler>alle überleben</span>",
+        &["überleben"],
+    ),
+    (
+        "reply fallback",
+        "<mx-reply><blockquote><a href=\"https://matrix.to/#/!room:example.org/$ev\">In reply to</a> \
+         <a href=\"https://matrix.to/#/@anna:example.org\">@anna:example.org</a><br>Ursprünglicher Text</blockquote></mx-reply>\
+         Die Antwort ist ja",
+        &["Ursprünglicher", "matrix.to", "In reply to"],
+    ),
+    (
+        "nested lists",
+        "<ul><li>Erstens<ul><li>Innen eins</li><li>Innen zwei</li></ul></li><li>Zweitens</li></ul>",
+        &[],
+    ),
+];
+
+fn html_source(html: &str) -> SourceContent {
+    SourceContent {
+        plain: html_to_plain(html),
+        html: Some(html.to_owned()),
+    }
+}
+
+#[test]
+fn an_identity_translation_restores_every_fixture() {
+    for (name, html, hidden) in FIXTURES {
+        let (protected, segments) = protect(&html_source(html));
+        let sent_html = protected.html.as_deref().unwrap();
+        for sent in [sent_html, protected.plain.as_str()] {
+            for word in *hidden {
+                assert!(!sent.contains(word), "{name}: {word} in {sent}");
+            }
+        }
+        let restored = restore(sent_html, sent_html, TextFormat::Html, &segments).unwrap();
+        let expected = outgoing_html(html);
+        assert_eq!(restored.html, expected, "{name}");
+        assert_eq!(restored.plain, html_to_plain(&expected), "{name}");
+        assert!(!restored.html.contains("@@") && !restored.plain.contains("@@"));
+    }
+}
+
+#[test]
+fn plain_text_protects_links_ids_and_code() {
+    let source = SourceContent {
+        plain: "Schau https://example.org/a?b=c, @anna:example.org: `make build` und \
+                ```\nlet x = 1;\n``` sowie @@7@@ und nochmal https://example.org/a?b=c."
+            .to_owned(),
+        html: None,
+    };
+    let (protected, segments) = protect(&source);
+    assert_eq!(
+        protected.plain,
+        "Schau @@1@@, @@2@@: @@3@@ und @@4@@ sowie @@5@@ und nochmal @@1@@."
+    );
+    assert_eq!(segments.len(), 5);
+    let restored = restore(
+        &protected.plain,
+        &protected.plain,
+        TextFormat::Text,
+        &segments,
+    )
+    .unwrap();
+    assert_eq!(restored.plain, source.plain);
+    assert_eq!(
+        restored.html,
+        html_escape(&source.plain).replace('\n', "<br>")
+    );
+}
+
+#[test]
+fn a_lost_or_repeated_placeholder_is_lost() {
+    let (protected, segments) = protect(&html_source(FIXTURES[1].1));
+    let sent = protected.html.unwrap();
+    assert!(sent.contains("@@1@@") && sent.contains("@@2@@"));
+    let dropped = sent.replace("@@2@@", "");
+    assert_eq!(
+        restore(&dropped, &sent, TextFormat::Html, &segments),
+        Err(Lost)
+    );
+    let doubled = format!("{sent} @@1@@");
+    assert_eq!(
+        restore(&doubled, &sent, TextFormat::Html, &segments),
+        Err(Lost)
+    );
+    let invented = format!("{sent} @@9@@");
+    assert_eq!(
+        restore(&invented, &sent, TextFormat::Html, &segments),
+        Err(Lost)
+    );
+}
+
+#[tokio::test]
+async fn the_restored_pill_and_spoiler_are_the_originals() {
+    let harness = Harness::new();
+    let source = html_source(&format!(
+        "Hallo {PILL}, das Ende des Buches: <span data-mx-spoiler>alle überleben</span>"
+    ));
+    let translator = FakeTranslator::tagging();
+    let result = translated(harness.run(&translator, &source).await);
+    for line in &result.lines {
+        assert!(line.html.contains(PILL), "{}", line.html);
+        assert!(line
+            .html
+            .contains("<span data-mx-spoiler=\"\">alle überleben</span>"));
+        assert!(line.plain.contains("Anna") && line.plain.contains(SPOILER_PLAIN));
+        assert!(!line.plain.contains("überleben"));
+    }
+    for (sent, _, _) in translator.calls() {
+        assert!(
+            !sent.contains("matrix.to") && !sent.contains("überleben"),
+            "{sent}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_lost_placeholder_is_retried_as_plain_text_then_fails_the_target() {
+    let harness = Harness::new();
+    let source = html_source(&format!("Hallo {PILL}, kommst du heute Abend zum Essen?"));
+
+    // Drops the placeholder in HTML only: the plain-text retry restores it.
+    let translator = FakeTranslator::new(|text, target, format| {
+        Ok(match format {
+            TextFormat::Html => tag(&text.replace("@@1@@", ""), target),
+            TextFormat::Text => tag(text, target),
+        })
+    });
+    let result = translated(harness.run(&translator, &source).await);
+    for target in ["en", "uk"] {
+        let formats: Vec<_> = translator
+            .calls()
+            .into_iter()
+            .filter(|c| c.1 == target)
+            .map(|c| c.2)
+            .collect();
+        assert_eq!(formats, [TextFormat::Html, TextFormat::Text], "{target}");
+    }
+    for line in &result.lines {
+        assert!(line.html.contains(PILL), "{}", line.html);
+        assert!(!line.html.contains("@@") && !line.plain.contains("@@"));
+    }
+
+    // Drops it both times: the target fails, not retried later.
+    let translator =
+        FakeTranslator::new(|text, target, _| Ok(tag(&text.replace("@@1@@", ""), target)));
+    let Err(NotTranslated::Failed(failure)) = harness.run(&translator, &source).await else {
+        panic!("expected a failed batch");
+    };
+    assert!(failure
+        .failed_targets
+        .iter()
+        .all(|f| f.error.class() == "validation_rejected"));
+    assert_eq!(translator.calls().len(), 4);
+    assert!(!should_retry_later(&failure));
+}
+
+#[test]
+fn length_checks_count_a_placeholder_not_the_long_url() {
+    let long_url = format!("https://example.org/{}", "a".repeat(400));
+    let source = SourceContent {
+        plain: format!("schau mal {long_url}"),
+        html: None,
+    };
+    let (protected, segments) = protect(&source);
+    assert_eq!(protected.plain, "schau mal @@1@@");
+    // A short answer around the placeholder is accepted although the restored line is long.
+    let line = build_line(
+        "en",
+        &protected.plain,
+        "look @@1@@",
+        TextFormat::Text,
+        &segments,
+    )
+    .unwrap();
+    assert_eq!(line.plain, format!("look {long_url}"));
+    // A runaway answer is caught although the URL would have hidden it.
+    let runaway = format!("look {} @@1@@", "again ".repeat(60));
+    assert!(build_line(
+        "en",
+        &protected.plain,
+        &runaway,
+        TextFormat::Text,
+        &segments
+    )
+    .is_err());
+}
+
+// ── Safe output (B4) ─────────────────────────────────────────────────────
+
+#[test]
+fn a_translation_and_an_edit_carry_empty_mentions() {
+    let json = serde_json::to_value(make_translation_content(
+        "🇬🇧 Hello @room".into(),
+        "🇬🇧 Hello @room".into(),
+        false,
+    ))
+    .unwrap();
+    assert_eq!(json["m.mentions"], serde_json::json!({}));
+    let edit = make_translation_edit(&[test_line("en")], true, eid("$bot:example.org"));
+    let json = serde_json::to_value(edit).unwrap();
+    assert_eq!(json["m.mentions"], serde_json::json!({}));
+    assert_eq!(json["m.new_content"]["m.mentions"], serde_json::json!({}));
+    assert_eq!(json["m.new_content"]["msgtype"], "m.notice");
+}
+
+#[tokio::test]
+async fn markup_outside_the_matrix_subset_is_removed_from_the_output() {
+    let harness = Harness::new();
+    let translator = FakeTranslator::new(|text, target, _| {
+        Ok(format!(
+            "<script>alert(1)</script><mx-reply>quoted</mx-reply>\
+             <b onclick=\"steal()\">[{target}]</b> {text}<style>p {{}}</style>"
+        ))
+    });
+    let source = source_content(&MessageType::Text(formatted_text())).unwrap();
+    let result = translated(harness.run(&translator, &source).await);
+    for line in &result.lines {
+        for gone in [
+            "<script", "alert", "onclick", "mx-reply", "quoted", "<style",
+        ] {
+            assert!(!line.html.contains(gone), "{gone} in {}", line.html);
+            assert!(!line.plain.contains(gone), "{gone} in {}", line.plain);
+        }
+        assert!(line.html.starts_with("<b>["));
+    }
+}
+
+#[tokio::test]
+async fn a_translation_equal_to_the_source_is_left_out() {
+    let harness = Harness::new();
+    let source = SourceContent {
+        plain: "ok".to_owned(),
+        html: None,
+    };
+    let echo = FakeTranslator::new(|text, _, _| Ok(format!(" {}! ", text.to_uppercase())));
+    assert!(matches!(
+        harness.run(&echo, &source).await,
+        Err(NotTranslated::Skipped(SkipReason::TranslationUnchanged))
+    ));
+
+    // English taken for German (the sender's remembered language): only Ukrainian is new.
+    harness.memory.lock().unwrap().insert(
+        (
+            "!room:example.org".to_owned(),
+            "@anna:example.org".to_owned(),
+        ),
+        "de".to_owned(),
+    );
+    let source = SourceContent {
+        plain: "dinner is ready".to_owned(),
+        html: None,
+    };
+    let translator = FakeTranslator::new(|text, target, _| {
+        Ok(match target {
+            "en" => "Dinner is ready.".to_owned(),
+            _ => tag(text, target),
+        })
+    });
+    let result = translated(harness.run(&translator, &source).await);
+    assert_eq!(result.lang, "de");
+    assert_eq!(line_targets(&result.lines), ["uk"]);
+}
+
+#[test]
+fn an_edit_with_nothing_left_to_translate_replaces_nothing_and_redacts() {
+    for reason in [
+        SkipReason::EditNoTranslatableText,
+        SkipReason::NoTranslatableText,
+        SkipReason::NoRemainingTargets,
+        SkipReason::TranslationUnchanged,
+    ] {
+        assert!(edit_leaves_nothing_to_translate(reason), "{reason:?}");
+    }
+    for reason in [
+        SkipReason::InputTooLong,
+        SkipReason::LanguageNotConfigured,
+        SkipReason::TranslationSuppressed,
+    ] {
+        assert!(!edit_leaves_nothing_to_translate(reason), "{reason:?}");
+    }
+}
+
+// ── Late retries (B5) ────────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn a_transient_failure_is_retried_at_five_minutes_and_not_again() {
+    let harness = Harness::new();
+    let source = source_content(&MessageType::Text(formatted_text())).unwrap();
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let translator = {
+        let down = Arc::clone(&down);
+        FakeTranslator::new(move |text, target, _| {
+            if down.load(Ordering::SeqCst) {
+                Err(TranslationError::new(
+                    TranslationErrorKind::Request,
+                    "refused",
+                ))
+            } else {
+                Ok(tag(text, target))
+            }
+        })
+    };
+    let Err(NotTranslated::Failed(failure)) = harness.run(&translator, &source).await else {
+        panic!("expected a failed batch");
+    };
+    assert!(should_retry_later(&failure));
+
+    down.store(false, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let attempts = std::sync::Mutex::new(Vec::new());
+    let (h, t, s) = (&harness, &translator, &source);
+    run_late_retries(&LATE_RETRIES_AFTER_FAILURE, &harness.stats, || {
+        attempts.lock().unwrap().push(started.elapsed());
+        async move {
+            match h.run(t, s).await {
+                Ok(_) => Reprocessed::Ran(CoreOutcome::Translated),
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    })
+    .await;
+    assert_eq!(*attempts.lock().unwrap(), [Duration::from_secs(300)]);
+    assert_eq!(harness.stats.late_retries.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        harness.stats.late_retries_succeeded.load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_undecryptable_event_is_retried_twice_at_most() {
+    let stats = Stats::new(Db::open_in_memory().unwrap());
+    let started = tokio::time::Instant::now();
+    let attempts = std::sync::Mutex::new(Vec::new());
+    run_late_retries(&LATE_RETRIES_UNDECRYPTABLE, &stats, || {
+        attempts.lock().unwrap().push(started.elapsed());
+        async { Reprocessed::Undecryptable }
+    })
+    .await;
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        [Duration::from_secs(30), Duration::from_secs(300)]
+    );
+    assert_eq!(stats.late_retries_succeeded.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_event_translated_in_the_meantime_is_skipped_as_already_translated() {
+    let db = Db::open_in_memory().unwrap();
+    let stats = Stats::new(db.clone());
+    let event_id = eid("$ev:example.org");
+    db.record_translation(event_id.as_str(), "$bot:example.org", "!room:example.org")
+        .await
+        .unwrap();
+    let ran = AtomicUsize::new(0);
+    let (db_ref, stats_ref, event_ref, ran_ref) = (&db, &stats, &event_id, &ran);
+    run_late_retries(&LATE_RETRIES_AFTER_FAILURE, &stats, move || {
+        reprocess_unless_translated(
+            db_ref,
+            stats_ref,
+            "!room:example.org",
+            event_ref,
+            async move {
+                ran_ref.fetch_add(1, Ordering::SeqCst);
+                Reprocessed::Ran(CoreOutcome::Translated)
+            },
+        )
+    })
+    .await;
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(stats.late_retries.load(Ordering::Relaxed), 1);
+    assert!(stats
+        .skipped_snapshot()
+        .contains(&("already_translated", 1)));
+}
+
+#[test]
+fn only_a_batch_that_failed_for_passing_reasons_is_retried_later() {
+    let batch = |kinds: &[TranslationErrorKind]| TranslationBatchFailure {
+        source: "de".to_owned(),
+        context: "message",
+        failed_targets: kinds
+            .iter()
+            .map(|kind| test_failure("en", 3, kind.clone()))
+            .collect(),
+        suppressed: true,
+    };
+    use TranslationErrorKind::*;
+    assert!(should_retry_later(&batch(&[Timeout, OverallTimeout])));
+    assert!(should_retry_later(&batch(&[HttpStatus(503), BackendBusy])));
+    assert!(!should_retry_later(&batch(&[Timeout, Rejected])));
+    assert!(!should_retry_later(&batch(&[HttpStatus(400)])));
+    assert!(!should_retry_later(&batch(&[Empty])));
+    assert!(!should_retry_later(&batch(&[])));
+}
+
+// ── Real backend run (skipped unless TRANSLATE_BOT_TEST_BACKEND is set) ──
+
+/// A LibreTranslate-compatible backend at `url`, through the bot's own request code.
+struct LiveBackend {
+    http: reqwest::Client,
+    url: String,
+}
+
+impl Translator for LiveBackend {
+    fn translate<'a>(
+        &'a self,
+        text: &'a str,
+        source: &'a str,
+        target: &'a str,
+        format: TextFormat,
+    ) -> BoxFuture<'a, Result<String, TranslationError>> {
+        async move {
+            let request = TranslateRequest {
+                q: text,
+                source,
+                target,
+                format: format.as_str(),
+                api_key: None,
+            };
+            post_translate(&self.http, &self.url, &request, Duration::from_secs(600)).await
+        }
+        .boxed()
+    }
+
+    fn detect<'a>(&'a self, _text: &'a str) -> BoxFuture<'a, Option<(String, f64)>> {
+        async { None }.boxed()
+    }
+}
+
+/// Sends six generic messages through protect, the backend and restore into the other room
+/// languages and prints each step. Run with
+/// `TRANSLATE_BOT_TEST_BACKEND=http://host:port cargo test live_backend -- --nocapture`.
+#[tokio::test]
+async fn live_backend_round_trip() {
+    let Ok(url) = std::env::var("TRANSLATE_BOT_TEST_BACKEND") else {
+        eprintln!("skipped: TRANSLATE_BOT_TEST_BACKEND is not set");
+        return;
+    };
+    let backend = LiveBackend {
+        http: reqwest::Client::new(),
+        url: url.trim_end_matches('/').to_owned(),
+    };
+    let plain = |text: &str| SourceContent {
+        plain: text.to_owned(),
+        html: None,
+    };
+    let messages = [
+        (
+            "pill",
+            html_source(&format!("Hallo {PILL}, kommst du heute Abend zum Essen?")),
+        ),
+        (
+            "link",
+            plain(
+                "Ich habe das Rezept gefunden: \
+                 https://www.example.org/rezepte/2026/kuerbis-suppe-mit-ingwer?ref=share \
+                 Wer kocht mit?",
+            ),
+        ),
+        (
+            "code",
+            html_source(
+                "Bitte vor dem Neustart <code>make build</code> ausführen und dann \
+                 <em>neu starten</em>.",
+            ),
+        ),
+        (
+            "spoiler",
+            html_source(
+                "Achtung, das Ende des Films: <span data-mx-spoiler>der Hund überlebt</span>!",
+            ),
+        ),
+        ("short German", plain("bis später, ich bring Brot mit")),
+        ("short Ukrainian", plain("вечеря готова, приходьте")),
+    ];
+    let langs = vec!["de".to_owned(), "en".to_owned(), "uk".to_owned()];
+    let memory = SenderLanguages::default();
+    let (mut sent_count, mut back_first, mut back_after_retry) = (0, 0, 0);
+    for (name, source) in &messages {
+        let (protected, segments) = protect(source);
+        let (lang, _) = detect_source_language(
+            &memory,
+            &langs,
+            "!room:example.org",
+            "@anna:example.org",
+            &protected.plain,
+            |_| async { None },
+        )
+        .await
+        .unwrap();
+        println!("### {name}\n");
+        println!(
+            "- source: `{}`",
+            source.html.as_deref().unwrap_or(&source.plain)
+        );
+        println!("- detected: `{lang}`");
+        let (sent, format) = match &protected.html {
+            Some(html) => (html.as_str(), TextFormat::Html),
+            None => (protected.plain.as_str(), TextFormat::Text),
+        };
+        println!("- sent ({}): `{sent}`", format.as_str());
+        for target in langs.iter().filter(|l| **l != lang) {
+            sent_count += 1;
+            let started = Instant::now();
+            let raw = backend
+                .translate(sent, &lang, target, format)
+                .await
+                .unwrap();
+            let took = started.elapsed().as_secs_f32();
+            println!("- **{target}** ({took:.1} s) raw: `{raw}`");
+            match restore(&raw, sent, format, &segments) {
+                Ok(restored) => {
+                    back_first += 1;
+                    back_after_retry += 1;
+                    println!("  - html: `{}`", restored.html);
+                    println!("  - plain: `{}`", restored.plain);
+                }
+                Err(Lost) => {
+                    println!("  - placeholder LOST");
+                    if format == TextFormat::Html {
+                        let raw = backend
+                            .translate(&protected.plain, &lang, target, TextFormat::Text)
+                            .await
+                            .unwrap();
+                        println!("  - plain-text retry raw: `{raw}`");
+                        match restore(&raw, &protected.plain, TextFormat::Text, &segments) {
+                            Ok(restored) => {
+                                back_after_retry += 1;
+                                println!("  - html: `{}`", restored.html);
+                            }
+                            Err(Lost) => println!("  - placeholder LOST again: target fails"),
+                        }
+                    }
+                }
+            }
+        }
+        println!();
+    }
+    println!(
+        "Placeholders intact: {back_first}/{sent_count} on the first request, \
+         {back_after_retry}/{sent_count} after the plain-text retry."
     );
 }

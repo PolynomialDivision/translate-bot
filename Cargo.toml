@@ -11,7 +11,9 @@ path = "src/main.rs"
 anyhow = "1"
 futures-util = "0.3"
 mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
-pulldown-cmark = "0.12"
+# HTML parsing and sanitising for the protected and the outgoing HTML; already in the tree
+# through ruma.
+ruma-html = "0.9"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # Already pulled in transitively via matrix-sdk's "sqlite" feature
 # (matrix-sdk-sqlite); declared directly so translate-bot can keep its own
@@ -22,9 +24,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+# Language detection among a room's languages (the crate the engine uses for /detect).
+whatlang = "0.16"
 
 [dev-dependencies]
 toml = "1"
+# Paused time for the late-retry tests.
+tokio = { version = "1", features = ["test-util"] }
 
 # A panic anywhere ends the bot and Docker restarts it, as a supervised task
 # that ends does (mxbot_common::supervise).

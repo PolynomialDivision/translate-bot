@@ -37,9 +37,18 @@ api_key = "YOUR_API_KEY"
 #   max_attempts = 5
 
 [translation]
-# Languages to translate between (bot translates between these two)
+# Languages to translate between: a message in one of them is translated into
+# all the others.
 langs = ["en", "de", "uk"]
-# Minimum detection confidence to attempt translation (0.0–1.0)
+# The bot detects a message's language itself, among the room's languages only
+# (whatlang), on the text without links, Matrix IDs and code. A message without
+# at least two letters is not translated (reason=no_translatable_text). A short
+# message the detector is unsure about takes its sender's last reliably
+# detected language in that room (kept in memory until a restart). A room with
+# a language the local detector does not know asks the backend's /detect.
+# Minimum detection confidence to attempt translation (0.0–1.0); a remembered
+# language always passes. 0.0 translates every message detected as one of the
+# room's languages.
 min_confidence = 0.5
 # Whether the translation references the original message at all (default: true).
 # true  → translation is a reply (or thread reply) to the original message
@@ -55,13 +64,20 @@ min_confidence = 0.5
 # trigger push notifications, making them less intrusive for room members who
 # are not the intended audience of the translation.
 # silent_messages = false
-# Maximum concurrent requests to LibreTranslate/ltengine across detection and
-# translation. Lower this if the backend degrades under bursts.
+# Maximum concurrent translation requests to LibreTranslate/ltengine (the
+# /detect fallback is not limited). Lower this if the backend degrades under
+# bursts.
 # backend_concurrency = 4
 # Retry and timeout policy for each Matrix message translation.
 # request_timeout_secs bounds one backend request; overall_timeout_secs bounds
 # the complete multi-target translation operation. If any required target still
-# fails after this budget, the bot sends no partial translation.
+# fails after this budget, the bot sends no partial translation. A formatted
+# message is sent as HTML and, only after a failure that is not transient
+# (rejected, empty, 4xx), once more as plain text.
+# When every target failed transiently or by the overall deadline (the backend
+# restarting, say), the message is tried again after 5 and 20 minutes; a
+# message that could not be decrypted when it arrived after 30 seconds and
+# 5 minutes. These late retries live in memory and end with a restart.
 # request_timeout_secs = 60
 # max_attempts = 3
 # retry_initial_backoff_ms = 250
@@ -71,6 +87,14 @@ min_confidence = 0.5
 # being monopolized by one very long message. Longer input is skipped with
 # reason=input_too_long instead of being sent to the backend.
 # max_input_chars = 4000
+# Not sent to the backend: mentions (pills), links, inline and block code,
+# custom emoji and spoilers are replaced by placeholders (@@1@@) and put back
+# into the translation; a spoiler stays hidden and untranslated. A translation
+# that loses a placeholder is retried as plain text, then dropped. The posted
+# HTML is limited to what Matrix allows, carries an empty m.mentions (nobody is
+# notified by a translation), and a target whose translation equals the
+# original is left out (reason=translation_unchanged when none is left). An
+# edit that leaves nothing to translate removes the old translation.
 # Senders never translated (exact Matrix IDs), e.g. bots that already post in
 # several languages. Their edits and captions are skipped too
 # (reason=ignored_sender in !translate debug).

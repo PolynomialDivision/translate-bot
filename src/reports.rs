@@ -84,6 +84,7 @@ pub(crate) fn translate_stats_report(state: &BotState) -> String {
          🌐 API failures: {}\n\
          📤 Send failures: {}\n\
          🔁 Retries: {} ({} succeeded)\n\
+         🕐 Late retries: {} ({} succeeded)\n\
          ⏭️ Skipped: {skipped_str}",
         s.events_seen.load(Ordering::Relaxed),
         s.translated.load(Ordering::Relaxed),
@@ -92,6 +93,8 @@ pub(crate) fn translate_stats_report(state: &BotState) -> String {
         s.matrix_send_failures.load(Ordering::Relaxed),
         s.retries.load(Ordering::Relaxed),
         s.retries_succeeded.load(Ordering::Relaxed),
+        s.late_retries.load(Ordering::Relaxed),
+        s.late_retries_succeeded.load(Ordering::Relaxed),
     )
 }
 
@@ -137,13 +140,108 @@ pub(crate) async fn translate_debug_report(state: &BotState, arg: &str) -> Strin
     }
 }
 
+/// How a reprocessed event ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Reprocessed {
+    /// The bot's translation of it.
+    AlreadyTranslated(String),
+    CheckFailed(String),
+    FetchFailed(String),
+    Undecryptable,
+    NotAMessage(String),
+    Ran(CoreOutcome),
+}
+
+impl Reprocessed {
+    pub(crate) fn succeeded(&self) -> bool {
+        *self == Self::Ran(CoreOutcome::Translated)
+    }
+
+    /// Whether a later attempt could end differently.
+    pub(crate) fn worth_another_try(&self) -> bool {
+        matches!(
+            self,
+            Self::CheckFailed(_)
+                | Self::FetchFailed(_)
+                | Self::Undecryptable
+                | Self::Ran(CoreOutcome::Failed { retry_later: true })
+        )
+    }
+}
+
+/// Runs `run` unless `event_id` already has a translation: the dedup lookup keeps retries,
+/// by hand or by timer, from ever producing a second translation.
+pub(crate) async fn reprocess_unless_translated(
+    db: &Db,
+    stats: &Stats,
+    room_id: &str,
+    event_id: &OwnedEventId,
+    run: impl Future<Output = Reprocessed>,
+) -> Reprocessed {
+    match db.lookup_translation(event_id.as_str()).await {
+        Ok(Some(bot_event_id)) => {
+            record_skip(
+                stats,
+                event_id,
+                room_id,
+                None,
+                "n/a",
+                "n/a",
+                SkipReason::AlreadyTranslated,
+            );
+            Reprocessed::AlreadyTranslated(bot_event_id)
+        }
+        Ok(None) => run.await,
+        Err(e) => Reprocessed::CheckFailed(e.to_string()),
+    }
+}
+
+/// Fetches `event_id` again (re-attempting decryption with the keys available now) and runs it
+/// through `handle_message_core`, bypassing the backlog cut-off. Shared by `!translate retry`
+/// and the late retries.
+pub(crate) async fn reprocess_event(
+    state: &BotState,
+    room: &Room,
+    event_id: &OwnedEventId,
+) -> Reprocessed {
+    reprocess_unless_translated(
+        &state.db,
+        &state.stats,
+        room.room_id().as_str(),
+        event_id,
+        async {
+            let timeline_event = match room.event(event_id, None).await {
+                Ok(ev) => ev,
+                Err(e) => return Reprocessed::FetchFailed(e.to_string()),
+            };
+            if timeline_event.kind.is_utd() {
+                return Reprocessed::Undecryptable;
+            }
+            let parsed: OriginalSyncRoomMessageEvent = match timeline_event
+                .kind
+                .raw()
+                .cast_ref_unchecked::<OriginalSyncRoomMessageEvent>()
+                .deserialize()
+            {
+                Ok(ev) => ev,
+                Err(e) => return Reprocessed::NotAMessage(e.to_string()),
+            };
+            // Boxed: handle_message_core can (transitively, via !translate retry)
+            // call back into itself, and an async fn can't recurse without indirection.
+            Reprocessed::Ran(
+                Box::pin(handle_message_core(state.clone(), room.clone(), parsed)).await,
+            )
+        },
+    )
+    .await
+}
+
 /// Re-processes a specific event through the normal translate-and-send
 /// pipeline. Refuses if `translation_map` already has an entry for it (the
 /// invariant this exists to serve: retrying must never create a duplicate
 /// translation: if one already exists, editing the original message is the
 /// correct way to update it). Also picks up events that couldn't be
-/// decrypted at sync time but can be decrypted now, since `Room::event`
-/// re-attempts decryption with whatever keys are currently available.
+/// decrypted at sync time but can be decrypted now.
 pub(crate) async fn translate_retry_command(state: &BotState, room: &Room, arg: &str) -> String {
     if arg.is_empty() {
         return "💡 Usage: !translate retry <event-id>".to_owned();
@@ -152,46 +250,21 @@ pub(crate) async fn translate_retry_command(state: &BotState, room: &Room, arg: 
         Ok(id) => id,
         Err(e) => return format!("❌ '{arg}' is not a valid event ID: {e}"),
     };
-
-    let already_translated = match state.db.lookup_translation(event_id.as_str()).await {
-        Ok(found) => found,
-        Err(e) => return format!("❌ Could not check existing translations for {event_id}: {e}"),
-    };
-    if let Some(bot_event_id) = already_translated {
-        record_skip(
-            state,
-            &event_id,
-            room.room_id().as_str(),
-            None,
-            "n/a",
-            "n/a",
-            SkipReason::AlreadyTranslated,
-        );
-        return format!(
+    match reprocess_event(state, room, &event_id).await {
+        Reprocessed::AlreadyTranslated(bot_event_id) => format!(
             "✅ {event_id} was already translated as {bot_event_id}.\n\
              ✏️ Edit the original message to force a new translation."
-        );
+        ),
+        Reprocessed::CheckFailed(e) => {
+            format!("❌ Could not check existing translations for {event_id}: {e}")
+        }
+        Reprocessed::FetchFailed(e) => format!("❌ Could not fetch {event_id}: {e}"),
+        Reprocessed::Undecryptable => {
+            format!("🔒 {event_id} is still not decryptable. I have no key for it.")
+        }
+        Reprocessed::NotAMessage(e) => format!("❌ {event_id} is not a room message: {e}"),
+        Reprocessed::Ran(_) => {
+            format!("🔁 Retried {event_id}.\n🔍 Run !translate debug {event_id} for the outcome.")
+        }
     }
-
-    let timeline_event = match room.event(&event_id, None).await {
-        Ok(ev) => ev,
-        Err(e) => return format!("❌ Could not fetch {event_id}: {e}"),
-    };
-    if timeline_event.kind.is_utd() {
-        return format!("🔒 {event_id} is still not decryptable. I have no key for it.");
-    }
-    let parsed: OriginalSyncRoomMessageEvent = match timeline_event
-        .kind
-        .raw()
-        .cast_ref_unchecked::<OriginalSyncRoomMessageEvent>()
-        .deserialize()
-    {
-        Ok(ev) => ev,
-        Err(e) => return format!("❌ {event_id} is not a room message: {e}"),
-    };
-
-    // Boxed: handle_message_core can (transitively, via !translate retry)
-    // call back into itself, and an async fn can't recurse without indirection.
-    Box::pin(handle_message_core(state.clone(), room.clone(), parsed)).await;
-    format!("🔁 Retried {event_id}.\n🔍 Run !translate debug {event_id} for the outcome.")
 }

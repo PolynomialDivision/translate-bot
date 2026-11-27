@@ -80,62 +80,59 @@ pub(crate) fn has_repeated_ngram_loop(text: &str, ngram_len: usize, min_repeats:
     false
 }
 
-pub(crate) async fn translate_text_target_with_retry(
-    state: &BotState,
-    plain: &str,
+/// Translates the protected source into `target`: as HTML when the source has formatting, then,
+/// after a failure that is not transient (rejected, empty, a lost placeholder, 4xx), once more as
+/// plain text without formatting.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn translate_target<T: Translator + ?Sized>(
+    translator: &T,
+    protected: &Protected,
+    segments: &[Segment],
     source: &str,
     target: &str,
+    policy: &TranslationRetryPolicy,
     attempts_by_target: Arc<Mutex<HashMap<String, usize>>>,
+    stats: &Stats,
 ) -> Result<TranslatedLine, TargetTranslationFailure> {
-    let policy = state.retry_policy();
-    retry_translation_operation(
-        target,
-        &policy,
-        attempts_by_target,
-        &state.stats,
-        || async {
-            let translated = state.translate(plain, source, target, "text").await?;
-            build_text_line(target, plain, translated)
-        },
-    )
-    .await
-}
-
-pub(crate) async fn translate_html_target_with_retry(
-    state: &BotState,
-    html: &str,
-    plain: &str,
-    source: &str,
-    target: &str,
-    attempts_by_target: Arc<Mutex<HashMap<String, usize>>>,
-) -> Result<TranslatedLine, TargetTranslationFailure> {
-    let policy = state.retry_policy();
-    let source_plain = html_to_plain(html);
-    let html_result = retry_translation_operation(
-        target,
-        &policy,
-        attempts_by_target.clone(),
-        &state.stats,
-        || async {
-            let translated_html = state.translate(html, source, target, "html").await?;
-            build_html_line(target, &source_plain, translated_html)
-        },
-    )
-    .await;
-
-    match html_result {
-        Ok(line) => Ok(line),
-        Err(html_failure) => {
-            warn!(
+    if let Some(html) = &protected.html {
+        let html_result = retry_translation_operation(
+            target,
+            policy,
+            attempts_by_target.clone(),
+            stats,
+            || async {
+                let translated = translator
+                    .translate(html, source, target, TextFormat::Html)
+                    .await?;
+                build_line(target, html, &translated, TextFormat::Html, segments)
+            },
+        )
+        .await;
+        match html_result {
+            Ok(line) => return Ok(line),
+            Err(failure) if failure.error.is_transient() => return Err(failure),
+            Err(failure) => warn!(
                 "HTML translation target={} failed after {} attempts class={} detail={}: falling back to text",
-                html_failure.target,
-                html_failure.attempts,
-                html_failure.error.class(),
-                html_failure.error.detail
-            );
-            translate_text_target_with_retry(state, plain, source, target, attempts_by_target).await
+                failure.target,
+                failure.attempts,
+                failure.error.class(),
+                failure.error.detail
+            ),
         }
     }
+    retry_translation_operation(target, policy, attempts_by_target, stats, || async {
+        let translated = translator
+            .translate(&protected.plain, source, target, TextFormat::Text)
+            .await?;
+        build_line(
+            target,
+            &protected.plain,
+            &translated,
+            TextFormat::Text,
+            segments,
+        )
+    })
+    .await
 }
 
 /// Decide whether a detected message should be translated and, if so, into
@@ -186,53 +183,166 @@ pub(crate) fn resolve_translation_targets(
     Ok(targets)
 }
 
-pub(crate) async fn translate_all_targets(
-    state: &BotState,
-    input: TranslationInput<'_>,
+/// What one run of the pipeline needs besides the source and the backend.
+pub(crate) struct Pipeline<'a> {
+    pub(crate) translation: &'a EffectiveTranslationConfig,
+    pub(crate) policy: TranslationRetryPolicy,
+    pub(crate) max_input_chars: usize,
+    pub(crate) stats: &'a Stats,
+    pub(crate) memory: &'a SenderLanguages,
+    /// "message", the media kind of a caption, or "edit": in logs and outcome records.
+    pub(crate) context: &'static str,
+    pub(crate) room_id: &'a str,
+    pub(crate) sender: &'a str,
+    pub(crate) event_id: &'a OwnedEventId,
+}
+
+/// A message's translation: the detected source language and one line per target posted.
+#[derive(Debug)]
+pub(crate) struct Translation {
+    pub(crate) lang: String,
+    pub(crate) lines: Vec<TranslatedLine>,
+}
+
+#[derive(Debug)]
+pub(crate) enum NotTranslated {
+    Skipped(SkipReason),
+    /// Already logged and counted.
+    Failed(TranslationBatchFailure),
+}
+
+/// From a message's text to its translation lines, the same for messages, captions and edits:
+/// protect, detect, choose targets, translate all, leave out what came back unchanged.
+pub(crate) async fn translate_source<T: Translator + ?Sized>(
+    translator: &T,
+    pipeline: &Pipeline<'_>,
+    source: &SourceContent,
+) -> Result<Translation, NotTranslated> {
+    let Pipeline {
+        translation,
+        context,
+        room_id,
+        event_id,
+        ..
+    } = *pipeline;
+    if source.plain.chars().count() > pipeline.max_input_chars {
+        return Err(NotTranslated::Skipped(SkipReason::InputTooLong));
+    }
+    let (protected, segments) = protect(source);
+
+    let (lang, confidence) = detect_source_language(
+        pipeline.memory,
+        &translation.langs,
+        room_id,
+        pipeline.sender,
+        &protected.plain,
+        |prose| async move { translator.detect(&prose).await },
+    )
+    .await
+    .map_err(|reason| {
+        if reason == SkipReason::LangDetectFailed {
+            warn!("Language detection failed for {context} {event_id} in {room_id}");
+        }
+        NotTranslated::Skipped(reason)
+    })?;
+    debug!("{context} {event_id} lang={lang} conf={confidence:.2} room={room_id}");
+
+    let targets =
+        resolve_translation_targets(context, room_id, event_id, &lang, confidence, translation)
+            .map_err(NotTranslated::Skipped)?;
+
+    let lines = translate_all_targets(translator, pipeline, &protected, &segments, &lang, targets)
+        .await
+        .map_err(NotTranslated::Failed)?;
+
+    // What an identity translation would give: a line equal to it says nothing new.
+    let unchanged = restore(
+        &protected.plain,
+        &protected.plain,
+        TextFormat::Text,
+        &segments,
+    )
+    .map(|r| r.plain)
+    .unwrap_or_default();
+    let lines: Vec<TranslatedLine> = lines
+        .into_iter()
+        .filter(|line| {
+            let same = same_text(&line.plain, &unchanged);
+            if same {
+                info!(
+                    "{context} {event_id} in {room_id}: the {} translation equals the source, left out",
+                    line.target
+                );
+            }
+            !same
+        })
+        .collect();
+    if lines.is_empty() {
+        return Err(NotTranslated::Skipped(SkipReason::TranslationUnchanged));
+    }
+    Ok(Translation { lang, lines })
+}
+
+/// Equal apart from case, whitespace and final punctuation.
+pub(crate) fn same_text(a: &str, b: &str) -> bool {
+    let normal = |s: &str| {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+            .trim_end_matches(|c: char| c.is_whitespace() || is_final_punctuation(c))
+            .to_owned()
+    };
+    normal(a) == normal(b)
+}
+
+fn is_final_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        '.' | '!' | '?' | ',' | ';' | ':' | '…' | '。' | '！' | '？' | '¡' | '¿'
+    )
+}
+
+/// Whether a failed batch is worth a late retry: every target failed transiently or by the
+/// overall deadline, none was rejected.
+pub(crate) fn should_retry_later(failure: &TranslationBatchFailure) -> bool {
+    !failure.failed_targets.is_empty()
+        && failure
+            .failed_targets
+            .iter()
+            .all(|f| f.error.is_transient() || f.error.kind == TranslationErrorKind::OverallTimeout)
+}
+
+pub(crate) async fn translate_all_targets<T: Translator + ?Sized>(
+    translator: &T,
+    pipeline: &Pipeline<'_>,
+    protected: &Protected,
+    segments: &[Segment],
     source: &str,
     target_langs: Vec<String>,
-    context: &'static str,
-    room_id: &str,
-    event_id: &OwnedEventId,
 ) -> Result<Vec<TranslatedLine>, TranslationBatchFailure> {
-    let policy = state.retry_policy();
+    let policy = &pipeline.policy;
     let attempts_by_target = Arc::new(Mutex::new(HashMap::new()));
     let futures = target_langs
         .iter()
         .map(|target| {
-            let attempts_by_target = Arc::clone(&attempts_by_target);
-            async move {
-                match input {
-                    TranslationInput::Text { plain } => {
-                        translate_text_target_with_retry(
-                            state,
-                            plain,
-                            source,
-                            target,
-                            attempts_by_target,
-                        )
-                        .await
-                    }
-                    TranslationInput::Html { html, plain } => {
-                        translate_html_target_with_retry(
-                            state,
-                            html,
-                            plain,
-                            source,
-                            target,
-                            attempts_by_target,
-                        )
-                        .await
-                    }
-                }
-            }
+            translate_target(
+                translator,
+                protected,
+                segments,
+                source,
+                target,
+                policy,
+                Arc::clone(&attempts_by_target),
+                pipeline.stats,
+            )
         })
         .collect::<Vec<_>>();
 
     let result = collect_all_or_nothing(
         source,
         &target_langs,
-        context,
+        pipeline.context,
         policy.overall_timeout,
         attempts_by_target,
         futures,
@@ -240,7 +350,7 @@ pub(crate) async fn translate_all_targets(
     .await;
 
     if let Err(ref failure) = result {
-        log_suppressed_translation(state, failure, room_id, event_id);
+        log_suppressed_translation(pipeline.stats, failure, pipeline.room_id, pipeline.event_id);
     }
     // For the status file: each message's translation done or failed.
     let translations = mxbot_common::supervise::report("translations");

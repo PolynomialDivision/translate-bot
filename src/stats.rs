@@ -23,6 +23,8 @@ pub(crate) enum SkipReason {
     EditNoTranslatableText,
     AlreadyTranslated,
     IgnoredSender,
+    NoTranslatableText,
+    TranslationUnchanged,
 }
 
 impl SkipReason {
@@ -44,6 +46,8 @@ impl SkipReason {
             Self::EditNoTranslatableText => "edit_no_translatable_text",
             Self::AlreadyTranslated => "already_translated",
             Self::IgnoredSender => "ignored_sender",
+            Self::NoTranslatableText => "no_translatable_text",
+            Self::TranslationUnchanged => "translation_unchanged",
         }
     }
 }
@@ -105,6 +109,8 @@ pub(crate) struct Stats {
     pub(crate) matrix_send_failures: AtomicU64,
     pub(crate) retries: AtomicU64,
     pub(crate) retries_succeeded: AtomicU64,
+    pub(crate) late_retries: AtomicU64,
+    pub(crate) late_retries_succeeded: AtomicU64,
     pub(crate) sync_reconnects: AtomicU64,
     pub(crate) skipped: RwLock<HashMap<&'static str, u64>>,
     pub(crate) recent: RwLock<VecDeque<EventOutcome>>,
@@ -122,6 +128,8 @@ impl Stats {
             matrix_send_failures: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             retries_succeeded: AtomicU64::new(0),
+            late_retries: AtomicU64::new(0),
+            late_retries_succeeded: AtomicU64::new(0),
             sync_reconnects: AtomicU64::new(0),
             skipped: RwLock::new(HashMap::new()),
             recent: RwLock::new(VecDeque::new()),
@@ -218,7 +226,7 @@ pub(crate) async fn record_translation(
 /// skip path in the pipeline stays consistent instead of drifting into its
 /// own ad-hoc log format.
 pub(crate) fn record_skip(
-    state: &BotState,
+    stats: &Stats,
     event_id: &OwnedEventId,
     room_id: &str,
     sender: Option<&str>,
@@ -226,8 +234,8 @@ pub(crate) fn record_skip(
     text_source: &'static str,
     reason: SkipReason,
 ) {
-    state.stats.record_skip(reason);
-    state.stats.push_outcome(EventOutcome {
+    stats.record_skip(reason);
+    stats.push_outcome(EventOutcome {
         event_id: event_id.clone(),
         room_id: room_id.to_owned(),
         sender: sender.map(str::to_owned),
@@ -258,7 +266,7 @@ pub(crate) fn record_skip(
 /// a translation that was produced but failed to deliver).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_translated(
-    state: &BotState,
+    stats: &Stats,
     event_id: &OwnedEventId,
     room_id: &str,
     sender: &str,
@@ -269,16 +277,13 @@ pub(crate) fn record_translated(
     matrix_send_ok: bool,
     duration: Duration,
 ) {
-    state.stats.translated.fetch_add(1, Ordering::Relaxed);
+    stats.translated.fetch_add(1, Ordering::Relaxed);
     let matrix_send = if matrix_send_ok { "ok" } else { "failed" };
     if !matrix_send_ok {
-        state
-            .stats
-            .matrix_send_failures
-            .fetch_add(1, Ordering::Relaxed);
+        stats.matrix_send_failures.fetch_add(1, Ordering::Relaxed);
     }
     let targets_joined = targets.join(",");
-    state.stats.push_outcome(EventOutcome {
+    stats.push_outcome(EventOutcome {
         event_id: event_id.clone(),
         room_id: room_id.to_owned(),
         sender: Some(sender.to_owned()),

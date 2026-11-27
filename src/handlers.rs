@@ -83,112 +83,15 @@ pub(crate) async fn lookup_translation_awaiting_pending(
     db.lookup_translation(original_event_id).await
 }
 
-/// Handles a caption attached to a media message (`m.image`, `m.video`,
-/// `m.audio`, `m.file`). `kind` is the short label used in logs and as the
-/// translation-target-resolution context (e.g. `"image"`, `"video"`).
-pub(crate) async fn handle_media_caption(
-    state: BotState,
-    room: Room,
-    event: OriginalSyncRoomMessageEvent,
-    caption: String,
-    kind: &'static str,
-) {
-    let started = Instant::now();
-    let room_id = room.room_id().as_str().to_owned();
-    let sender = event.sender.as_str().to_owned();
-
-    let Some((lang, confidence)) = state.detect(&caption).await else {
-        warn!(
-            "Language detection failed for {kind} caption {} in {} ({})",
-            event.event_id, room_id, event.sender
-        );
-        record_skip(
-            &state,
-            &event.event_id,
-            &room_id,
-            Some(&sender),
-            kind,
-            "caption",
-            SkipReason::LangDetectFailed,
-        );
-        return;
-    };
-
-    debug!(
-        "{kind} caption {} lang={lang} conf={confidence:.2} sender={} room={}",
-        event.event_id, event.sender, room_id
-    );
-
-    let translation = state.translation_for_room(&room_id);
-
-    let targets = match resolve_translation_targets(
-        kind,
-        &room_id,
-        &event.event_id,
-        &lang,
-        confidence,
-        &translation,
-    ) {
-        Ok(targets) => targets,
-        Err(reason) => {
-            record_skip(
-                &state,
-                &event.event_id,
-                &room_id,
-                Some(&sender),
-                kind,
-                "caption",
-                reason,
-            );
-            return;
-        }
-    };
-
-    let lines = match translate_all_targets(
-        &state,
-        TranslationInput::Text { plain: &caption },
-        &lang,
-        targets.clone(),
-        kind,
-        &room_id,
-        &event.event_id,
-    )
-    .await
-    {
-        Ok(lines) => lines,
-        Err(_) => return,
-    };
-    let (plain_body, html_body) = build_translation_bodies(&lines);
-    let mut content = make_translation_content(plain_body, html_body, translation.silent_messages);
-    let in_thread = matches!(&event.content.relates_to, Some(Relation::Thread(_)));
-    let thread_root = resolve_thread_root(&event);
-    content.relates_to = make_relation(
-        &event.event_id,
-        &thread_root,
-        translation.reply_to_original,
-        translation.thread_replies,
-        in_thread,
-    );
-
-    let send_result = send_with_retry(&room, content).await;
-    record_translated(
-        &state,
-        &event.event_id,
-        &room_id,
-        &sender,
-        kind,
-        "caption",
-        &lang,
-        &targets,
-        send_result.is_ok(),
-        started.elapsed(),
-    );
-    match send_result {
-        Ok(bot_event_id) => {
-            record_translation(&state, &event.event_id, &bot_event_id, &room_id).await
-        }
-        Err(e) => error!("Failed to send {kind} caption translation: {e}"),
-    }
+/// How handling one event ended, for the late retries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoreOutcome {
+    Translated,
+    Skipped,
+    /// `retry_later`: every target failed transiently or by the overall deadline.
+    Failed {
+        retry_later: bool,
+    },
 }
 
 /// Returns `Some((kind, caption))` for a msgtype that has a caption slot
@@ -207,6 +110,56 @@ pub(crate) fn media_caption_kind(msgtype: &MessageType) -> Option<(&'static str,
     }
 }
 
+fn formatted_caption(msgtype: &MessageType) -> Option<&FormattedBody> {
+    match msgtype {
+        MessageType::Image(m) => m.formatted_caption(),
+        MessageType::Video(m) => m.formatted_caption(),
+        MessageType::Audio(m) => m.formatted_caption(),
+        MessageType::File(m) => m.formatted_caption(),
+        _ => None,
+    }
+}
+
+fn html_body(formatted: Option<&FormattedBody>) -> Option<String> {
+    formatted
+        .filter(|f| f.format == MessageFormat::Html)
+        .map(|f| f.body.clone())
+}
+
+/// The translatable text of a message, a caption or an edit's new content: the body of `m.text`
+/// and `m.emote` without the reply fallback, or a media caption, each with its HTML. m.notice
+/// and other msgtypes are not translated: notices are what bots (this one included) post, and
+/// translating them risks loops between bots in shared rooms.
+pub(crate) fn source_content(msgtype: &MessageType) -> Result<SourceContent, SkipReason> {
+    let (body, formatted) = match msgtype {
+        MessageType::Text(t) => (t.body.as_str(), t.formatted.as_ref()),
+        MessageType::Emote(e) => (e.body.as_str(), e.formatted.as_ref()),
+        other => {
+            let (_, caption) = media_caption_kind(other).ok_or(SkipReason::UnsupportedMsgtype)?;
+            // `caption()` is only set when `body` differs from `filename`: a bare file name
+            // ("1000006546.jpg") is never taken for a caption.
+            let caption = caption
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or(SkipReason::NoCaption)?;
+            return Ok(SourceContent {
+                plain: caption.to_owned(),
+                html: html_body(formatted_caption(other)),
+            });
+        }
+    };
+    let plain = strip_reply_fallback(body.trim()).trim();
+    if plain.is_empty() {
+        return Err(SkipReason::EmptyText);
+    }
+    Ok(SourceContent {
+        plain: plain.to_owned(),
+        html: html_body(formatted),
+    })
+}
+
+/// A new message, as delivered by sync: skipped when it predates the start-up cut-off, retried
+/// later when every target failed for a passing reason.
 pub(crate) async fn handle_message(
     state: BotState,
     room: Room,
@@ -219,13 +172,13 @@ pub(crate) async fn handle_message(
     // place; this check only catches whatever slips through that.
     //
     // This check lives here rather than in handle_message_core so that
-    // `!translate retry` (which necessarily reprocesses an old event) can
-    // call handle_message_core directly and bypass it.
+    // `!translate retry` and the late retries (which reprocess an old event)
+    // can call handle_message_core directly and bypass it.
     if let Some(event_time) = event.origin_server_ts.to_system_time() {
         if event_time < state.startup_time {
             info!("Skipping backlog message {} (pre-startup)", event.event_id);
             record_skip(
-                &state,
+                &state.stats,
                 &event.event_id,
                 room.room_id().as_str(),
                 Some(event.sender.as_str()),
@@ -237,14 +190,18 @@ pub(crate) async fn handle_message(
         }
     }
 
-    handle_message_core(state, room, event).await;
+    let event_id = event.event_id.clone();
+    let outcome = handle_message_core(state.clone(), room.clone(), event).await;
+    if outcome == (CoreOutcome::Failed { retry_later: true }) {
+        schedule_late_retries(&state, &room, event_id, &LATE_RETRIES_AFTER_FAILURE);
+    }
 }
 
 pub(crate) async fn handle_message_core(
     state: BotState,
     room: Room,
     event: OriginalSyncRoomMessageEvent,
-) {
+) -> CoreOutcome {
     let started = Instant::now();
     let room_id = room.room_id().as_str().to_owned();
     let sender = event.sender.as_str().to_owned();
@@ -262,7 +219,7 @@ pub(crate) async fn handle_message_core(
             event.event_id
         );
         record_skip(
-            &state,
+            &state.stats,
             &event.event_id,
             &room_id,
             Some(&sender),
@@ -270,7 +227,7 @@ pub(crate) async fn handle_message_core(
             "n/a",
             SkipReason::IgnoredSender,
         );
-        return;
+        return CoreOutcome::Skipped;
     }
 
     // Edits arrive as m.replace: route them to handle_edit and stop.
@@ -279,8 +236,7 @@ pub(crate) async fn handle_message_core(
     if let Some(Relation::Replacement(ref replacement)) = event.content.relates_to {
         let original_event_id = replacement.event_id.clone();
         let new_content = replacement.new_content.clone();
-        handle_edit(state, room, original_event_id, new_content).await;
-        return;
+        return handle_edit(state, room, &sender, original_event_id, new_content).await;
     }
 
     // Idempotency guard: if this event_id was already translated, don't do
@@ -297,7 +253,7 @@ pub(crate) async fn handle_message_core(
                 event.event_id
             );
             record_skip(
-                &state,
+                &state.stats,
                 &event.event_id,
                 &room_id,
                 Some(&sender),
@@ -305,7 +261,7 @@ pub(crate) async fn handle_message_core(
                 "n/a",
                 SkipReason::AlreadyTranslated,
             );
-            return;
+            return CoreOutcome::Skipped;
         }
         Ok(None) => {}
         Err(e) => warn!(
@@ -320,78 +276,14 @@ pub(crate) async fn handle_message_core(
     // mapping. Held for the rest of this function, across every await below.
     let _pending_guard = mark_pending(&state.pending_translations, &event.event_id);
 
-    // Media messages can carry a user-written caption in `body`. Per the
-    // Matrix media-caption spec, `caption()` only returns it when `body`
-    // differs from `filename`. A bare filename (e.g. "1000006546.jpg") is
-    // never mistaken for a caption.
-    if let Some((kind, caption)) = media_caption_kind(&event.content.msgtype) {
-        let caption = caption
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        match caption {
-            Some(caption) if caption.chars().count() > state.translation.max_input_chars => {
-                record_skip(
-                    &state,
-                    &event.event_id,
-                    &room_id,
-                    Some(&sender),
-                    kind,
-                    "caption",
-                    SkipReason::InputTooLong,
-                )
-            }
-            Some(caption) => {
-                info!("Translating caption from m.{kind} event {}", event.event_id);
-                handle_media_caption(state, room, event, caption, kind).await;
-            }
-            None => record_skip(
-                &state,
-                &event.event_id,
-                &room_id,
-                Some(&sender),
-                kind,
-                "caption",
-                SkipReason::NoCaption,
-            ),
-        }
-        return;
-    }
-
-    // m.text and m.emote carry the same body/formatted shape and are both
-    // genuine user-written text; other msgtypes (m.notice, m.location, ...)
-    // are not translated. m.notice in particular is left alone deliberately:
-    // it's the shape bots/servers use for their own chatter (including this
-    // bot's own translations), so translating it risks feedback loops with
-    // other notice-emitting bots in shared rooms.
-    let (raw, formatted) = match &event.content.msgtype {
-        MessageType::Text(t) => (t.body.as_str(), t.formatted.as_ref()),
-        MessageType::Emote(e) => (e.body.as_str(), e.formatted.as_ref()),
-        other => {
-            record_skip(
-                &state,
-                &event.event_id,
-                &room_id,
-                Some(&sender),
-                other.msgtype(),
-                "body",
-                SkipReason::UnsupportedMsgtype,
-            );
-            return;
-        }
-    };
-    let msgtype_label = event.content.msgtype.msgtype();
-    let is_command_eligible = matches!(event.content.msgtype, MessageType::Text(_));
-    let raw = raw.trim();
-
-    // Admin commands only apply to genuine m.text, not m.emote.
-    if is_command_eligible {
-        // Admin command family: !translate status | stats | debug <event-id>
-        // | retry <event-id> | version
+    // Admin command family, in genuine m.text only (not m.emote): !translate status | stats |
+    // debug <event-id> | retry <event-id> | version
+    if let MessageType::Text(text) = &event.content.msgtype {
+        let raw = text.body.trim();
         if raw == "!translate" || raw.starts_with("!translate ") {
             if !state.bot.is_admin(&event.sender) {
                 warn!("!translate from non-admin {}, ignored", event.sender);
-                return;
+                return CoreOutcome::Skipped;
             }
             let rest = raw["!translate".len()..].trim();
             let (subcommand, arg) = rest
@@ -415,107 +307,50 @@ pub(crate) async fn handle_message_core(
             {
                 warn!("Failed to send !translate reply: {e}");
             }
-            return;
+            return CoreOutcome::Skipped;
         }
     }
 
-    let text = strip_reply_fallback(raw);
-    let text = text.trim();
-    if text.is_empty() {
-        record_skip(
-            &state,
-            &event.event_id,
-            &room_id,
-            Some(&sender),
-            msgtype_label,
-            "body",
-            SkipReason::EmptyText,
-        );
-        return;
-    }
-    if text.chars().count() > state.translation.max_input_chars {
-        record_skip(
-            &state,
-            &event.event_id,
-            &room_id,
-            Some(&sender),
-            msgtype_label,
-            "body",
-            SkipReason::InputTooLong,
-        );
-        return;
-    }
-
-    let Some((lang, confidence)) = state.detect(text).await else {
-        warn!(
-            "Language detection failed for {} in {} ({})",
-            event.event_id, room_id, event.sender
-        );
-        record_skip(
-            &state,
-            &event.event_id,
-            &room_id,
-            Some(&sender),
-            msgtype_label,
-            "body",
-            SkipReason::LangDetectFailed,
-        );
-        return;
+    let (context, msgtype_label, text_source) = match media_caption_kind(&event.content.msgtype) {
+        Some((kind, _)) => (kind, kind, "caption"),
+        None => ("message", event.content.msgtype.msgtype(), "body"),
     };
-
-    debug!(
-        "{} lang={lang} conf={confidence:.2} sender={} room={}",
-        event.event_id, event.sender, room_id
-    );
+    let skip = |reason| {
+        record_skip(
+            &state.stats,
+            &event.event_id,
+            &room_id,
+            Some(&sender),
+            msgtype_label,
+            text_source,
+            reason,
+        );
+        CoreOutcome::Skipped
+    };
+    let source = match source_content(&event.content.msgtype) {
+        Ok(source) => source,
+        Err(reason) => return skip(reason),
+    };
+    if text_source == "caption" {
+        info!(
+            "Translating caption from m.{context} event {}",
+            event.event_id
+        );
+    }
 
     let translation = state.translation_for_room(&room_id);
-
-    let targets = match resolve_translation_targets(
-        "message",
-        &room_id,
-        &event.event_id,
-        &lang,
-        confidence,
-        &translation,
-    ) {
-        Ok(targets) => targets,
-        Err(reason) => {
-            record_skip(
-                &state,
-                &event.event_id,
-                &room_id,
-                Some(&sender),
-                msgtype_label,
-                "body",
-                reason,
-            );
-            return;
+    let pipeline = state.pipeline(&translation, context, &room_id, &sender, &event.event_id);
+    let result = match translate_source(&state, &pipeline, &source).await {
+        Ok(result) => result,
+        Err(NotTranslated::Skipped(reason)) => return skip(reason),
+        Err(NotTranslated::Failed(failure)) => {
+            return CoreOutcome::Failed {
+                retry_later: should_retry_later(&failure),
+            }
         }
     };
 
-    let html_to_translate = match formatted {
-        Some(fb) if fb.format == MessageFormat::Html => Some(strip_mx_reply(&fb.body)),
-        _ => None,
-    };
-    let input = match html_to_translate.as_deref() {
-        Some(html) => TranslationInput::Html { html, plain: text },
-        None => TranslationInput::Text { plain: text },
-    };
-    let lines = match translate_all_targets(
-        &state,
-        input,
-        &lang,
-        targets.clone(),
-        "message",
-        &room_id,
-        &event.event_id,
-    )
-    .await
-    {
-        Ok(lines) => lines,
-        Err(_) => return,
-    };
-    let (plain_body, html_body) = build_translation_bodies(&lines);
+    let (plain_body, html_body) = build_translation_bodies(&result.lines);
     let mut content = make_translation_content(plain_body, html_body, translation.silent_messages);
     let in_thread = matches!(&event.content.relates_to, Some(Relation::Thread(_)));
     let thread_root = resolve_thread_root(&event);
@@ -532,29 +367,35 @@ pub(crate) async fn handle_message_core(
 
     let send_result = send_with_retry(&room, content).await;
     record_translated(
-        &state,
+        &state.stats,
         &event.event_id,
         &room_id,
         &sender,
         msgtype_label,
-        "body",
-        &lang,
-        &targets,
+        text_source,
+        &result.lang,
+        &line_targets(&result.lines),
         send_result.is_ok(),
         started.elapsed(),
     );
     match send_result {
         Ok(bot_event_id) => {
-            record_translation(&state, &event.event_id, &bot_event_id, &room_id).await
+            record_translation(&state, &event.event_id, &bot_event_id, &room_id).await;
+            CoreOutcome::Translated
         }
-        Err(e) => error!("Failed to send translation: {e}"),
+        Err(e) => {
+            error!("Failed to send {context} translation: {e}");
+            CoreOutcome::Failed { retry_later: false }
+        }
     }
 }
 
+pub(crate) fn line_targets(lines: &[TranslatedLine]) -> Vec<String> {
+    lines.iter().map(|line| line.target.clone()).collect()
+}
+
 /// Called when a redaction event is received. If `redacted_id` is an original
-/// message the bot translated, redacts the bot's translation too and removes
-/// the now-stale mapping (so a later redaction of the same event, e.g. a
-/// federation replay, is a no-op rather than a repeat redact attempt).
+/// message the bot translated, redacts the bot's translation too.
 pub(crate) async fn handle_redaction(state: BotState, room: Room, redacted_id: OwnedEventId) {
     let bot_event_id = match lookup_translation_awaiting_pending(
         &state.db,
@@ -582,15 +423,28 @@ pub(crate) async fn handle_redaction(state: BotState, room: Room, redacted_id: O
         "Original message {redacted_id} was redacted: \
          redacting bot translation {bot_event_id}"
     );
+    redact_translation(&state, &room, &redacted_id, &bot_event_id).await;
+}
 
-    if let Err(e) = room.redact(&bot_event_id, None, None).await {
+/// Redacts the bot's translation of `original_event_id` and removes the now-stale mapping (so a
+/// later redaction of the same event, e.g. a federation replay, is a no-op rather than a repeat
+/// redact attempt).
+pub(crate) async fn redact_translation(
+    state: &BotState,
+    room: &Room,
+    original_event_id: &OwnedEventId,
+    bot_event_id: &OwnedEventId,
+) {
+    if let Err(e) = room.redact(bot_event_id, None, None).await {
         warn!("Failed to redact translation {bot_event_id}: {e}");
         return;
     }
-
-    // Remove from DB so we don't attempt a double-redact.
-    if let Err(e) = state.db.remove_translation(redacted_id.as_str()).await {
-        warn!("Failed to remove translation record for {redacted_id}: {e}");
+    if let Err(e) = state
+        .db
+        .remove_translation(original_event_id.as_str())
+        .await
+    {
+        warn!("Failed to remove translation record for {original_event_id}: {e}");
     }
 }
 
@@ -605,38 +459,29 @@ pub(crate) fn resolve_thread_root(event: &OriginalSyncRoomMessageEvent) -> Owned
     }
 }
 
-/// Extracts the translatable text from an edit's new content: the body
-/// (reply-fallback stripped) for `m.text`/`m.emote`, or the caption for
-/// caption-bearing media types (a caption can itself be edited: the new
-/// content then carries the same media msgtype as the original). Returns
-/// `None` when there is nothing translatable (unsupported msgtype, a
-/// filename-only caption, or empty text).
-pub(crate) fn extract_edit_text(msgtype: &MessageType) -> Option<String> {
-    let raw = match msgtype {
-        MessageType::Text(t) => t.body.as_str(),
-        MessageType::Emote(e) => e.body.as_str(),
-        other => {
-            let (_, caption) = media_caption_kind(other)?;
-            return caption
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
-        }
-    };
-    let text = strip_reply_fallback(raw.trim());
-    let text = text.trim();
-    (!text.is_empty()).then(|| text.to_owned())
+/// Whether an edit that ends with `reason` leaves nothing to translate, so that the old
+/// translation would contradict the edited message.
+pub(crate) fn edit_leaves_nothing_to_translate(reason: SkipReason) -> bool {
+    matches!(
+        reason,
+        SkipReason::EditNoTranslatableText
+            | SkipReason::NoTranslatableText
+            | SkipReason::NoRemainingTargets
+            | SkipReason::TranslationUnchanged
+    )
 }
 
 /// Called when a user edits a message the bot previously translated.
 /// Re-translates the new content and edits the bot's existing translation
 /// in-place using m.replace. No new message is sent, thread context is preserved.
+/// An edit that leaves nothing to translate redacts the translation instead.
 pub(crate) async fn handle_edit(
     state: BotState,
     room: Room,
+    sender: &str,
     original_event_id: OwnedEventId,
     new_content: RoomMessageEventContentWithoutRelation,
-) {
+) -> CoreOutcome {
     let started = Instant::now();
     let room_id = room.room_id().as_str().to_owned();
     let msgtype_label = new_content.msgtype.msgtype();
@@ -654,156 +499,134 @@ pub(crate) async fn handle_edit(
         Ok(id) => id,
         Err(e) => {
             warn!("Failed to look up translation for edit of {original_event_id}: {e}");
-            return;
+            return CoreOutcome::Skipped;
         }
     };
     let bot_event_id = bot_event_id.and_then(|id| matrix_sdk::ruma::EventId::parse(id).ok());
 
-    let Some(bot_event_id) = bot_event_id else {
-        info!("Edit for unknown event {original_event_id}, no cached translation, ignoring");
+    let skip = |reason| {
         record_skip(
-            &state,
+            &state.stats,
             &original_event_id,
             &room_id,
             None,
             msgtype_label,
             "edit",
-            SkipReason::EditUnknownEvent,
+            reason,
         );
-        return;
+        CoreOutcome::Skipped
+    };
+    let Some(bot_event_id) = bot_event_id else {
+        info!("Edit for unknown event {original_event_id}, no cached translation, ignoring");
+        return skip(SkipReason::EditUnknownEvent);
     };
 
     // Use ONLY m.new_content as the source of truth (full replacement, not a diff).
-    let Some(text) = extract_edit_text(&new_content.msgtype) else {
-        info!(
-            "Skipping edit of {original_event_id}: no translatable text in new content (msgtype={})",
-            msgtype_label
-        );
-        record_skip(
-            &state,
-            &original_event_id,
-            &room_id,
-            None,
-            msgtype_label,
-            "edit",
-            SkipReason::EditNoTranslatableText,
-        );
-        return;
-    };
-    if text.chars().count() > state.translation.max_input_chars {
-        info!(
-            "Skipping edit of {original_event_id}: input is {} chars, exceeds max_input_chars={}",
-            text.chars().count(),
-            state.translation.max_input_chars
-        );
-        record_skip(
-            &state,
-            &original_event_id,
-            &room_id,
-            None,
-            msgtype_label,
-            "edit",
-            SkipReason::InputTooLong,
-        );
-        return;
-    }
-    let text = text.as_str();
-
-    let Some((lang, confidence)) = state.detect(text).await else {
-        warn!("Language detection failed for edit of {original_event_id} in {room_id}");
-        record_skip(
-            &state,
-            &original_event_id,
-            &room_id,
-            None,
-            msgtype_label,
-            "edit",
-            SkipReason::LangDetectFailed,
-        );
-        return;
-    };
-
     let translation = state.translation_for_room(&room_id);
-
-    let targets = match resolve_translation_targets(
-        "edit",
-        &room_id,
-        &original_event_id,
-        &lang,
-        confidence,
-        &translation,
-    ) {
-        Ok(targets) => targets,
-        Err(reason) => {
-            record_skip(
-                &state,
-                &original_event_id,
-                &room_id,
-                None,
-                msgtype_label,
-                "edit",
-                reason,
-            );
-            return;
+    let pipeline = state.pipeline(&translation, "edit", &room_id, sender, &original_event_id);
+    let result = match source_content(&new_content.msgtype) {
+        Ok(source) => translate_source(&state, &pipeline, &source).await,
+        Err(_) => Err(NotTranslated::Skipped(SkipReason::EditNoTranslatableText)),
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(NotTranslated::Skipped(reason)) => {
+            let outcome = skip(reason);
+            if edit_leaves_nothing_to_translate(reason) {
+                info!(
+                    "Edit of {original_event_id} leaves nothing to translate ({}): \
+                     redacting translation {bot_event_id}",
+                    reason.as_str()
+                );
+                redact_translation(&state, &room, &original_event_id, &bot_event_id).await;
+            }
+            return outcome;
         }
+        // Transient or not, the old translation stays; an edit is not retried later, a newer
+        // edit could have replaced it by then.
+        Err(NotTranslated::Failed(_)) => return CoreOutcome::Failed { retry_later: false },
     };
 
-    let lines = match translate_all_targets(
-        &state,
-        TranslationInput::Text { plain: text },
-        &lang,
-        targets.clone(),
-        "edit",
-        &room_id,
-        &original_event_id,
-    )
-    .await
-    {
-        Ok(lines) => lines,
-        Err(_) => return,
-    };
-    let (new_body, new_html) = build_translation_bodies(&lines);
-
-    // Build m.replace pointing at the bot's existing translation event.
-    // The thread membership is inherited from bot_event_id. No thread relation needed here.
-    // Preserve the same msgtype (m.notice vs m.text) as the original translation.
-    let inner_msgtype = if translation.silent_messages {
-        MessageType::Notice(NoticeMessageEventContent::html(
-            new_body.clone(),
-            new_html.clone(),
-        ))
-    } else {
-        MessageType::Text(TextMessageEventContent::html(
-            new_body.clone(),
-            new_html.clone(),
-        ))
-    };
-    let new_without = RoomMessageEventContentWithoutRelation::new(inner_msgtype);
-    let mut edit_content = make_translation_content(
-        format!("* {new_body}"),
-        new_html,
+    let edit_content = make_translation_edit(
+        &result.lines,
         translation.silent_messages,
-    );
-    edit_content.relates_to = Some(Relation::Replacement(Replacement::new(
         bot_event_id.clone(),
-        new_without,
-    )));
-
+    );
     info!("Editing bot translation {bot_event_id} for edit of {original_event_id}");
     let send_result = send_with_retry(&room, edit_content).await;
     record_translated(
-        &state,
+        &state.stats,
         &original_event_id,
         &room_id,
         "-",
         msgtype_label,
         "edit",
-        &lang,
-        &targets,
+        &result.lang,
+        &line_targets(&result.lines),
         send_result.is_ok(),
         started.elapsed(),
     );
-    if let Err(e) = send_result {
-        error!("Failed to send translation edit: {e}");
+    match send_result {
+        Ok(_) => CoreOutcome::Translated,
+        Err(e) => {
+            error!("Failed to send translation edit: {e}");
+            CoreOutcome::Failed { retry_later: false }
+        }
     }
+}
+
+/// Late retries of an event that could not be decrypted at sync time (its key often arrives
+/// seconds later), counted from the failure.
+pub(crate) const LATE_RETRIES_UNDECRYPTABLE: [Duration; 2] =
+    [Duration::from_secs(30), Duration::from_secs(5 * 60)];
+/// Late retries of a message whose every target failed transiently or by the overall deadline
+/// (the backend restarting, say), counted from the failure.
+pub(crate) const LATE_RETRIES_AFTER_FAILURE: [Duration; 2] =
+    [Duration::from_secs(5 * 60), Duration::from_secs(20 * 60)];
+
+/// Calls `attempt` at each of `delays` after now until one succeeds or a further try could not
+/// end differently.
+pub(crate) async fn run_late_retries<F, Fut>(delays: &[Duration], stats: &Stats, mut attempt: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Reprocessed>,
+{
+    let start = tokio::time::Instant::now();
+    for delay in delays {
+        tokio::time::sleep_until(start + *delay).await;
+        stats.late_retries.fetch_add(1, Ordering::Relaxed);
+        let outcome = attempt().await;
+        if outcome.succeeded() {
+            stats.late_retries_succeeded.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if !outcome.worth_another_try() {
+            return;
+        }
+    }
+}
+
+/// Reprocesses `event_id` at `delays` in a task of its own, in memory only (gone after a
+/// restart). Each attempt holds an `inflight` slot like a live message.
+pub(crate) fn schedule_late_retries(
+    state: &BotState,
+    room: &Room,
+    event_id: OwnedEventId,
+    delays: &'static [Duration],
+) {
+    info!("Scheduling late retries of {event_id} after {delays:?}");
+    let state = state.clone();
+    let room = room.clone();
+    tokio::spawn(async move {
+        let stats = Arc::clone(&state.stats);
+        run_late_retries(delays, &stats, || {
+            let (state, room, event_id) = (state.clone(), room.clone(), event_id.clone());
+            async move {
+                let _permit = state.inflight.acquire().await;
+                info!("Late retry of {event_id}");
+                reprocess_event(&state, &room, &event_id).await
+            }
+        })
+        .await;
+    });
 }
